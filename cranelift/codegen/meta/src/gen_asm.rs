@@ -1,7 +1,12 @@
 //! Generate the Cranelift-specific integration of the x64 assembler.
 
-use cranelift_assembler_x64_meta::dsl::{Format, Inst, Mutability, Operand, OperandKind};
+use cranelift_assembler_x64_meta::dsl::{
+    format::RegClass, Format, Inst, Mutability, Operand, OperandKind,
+};
 use cranelift_srcgen::{fmtln, Formatter};
+
+/// This factors out use of the assembler crate name.
+const ASM: &str = "cranelift_assembler_x64";
 
 /// Returns the Rust type used for the `IsleConstructorRaw` variants.
 pub fn rust_param_raw(op: &Operand) -> String {
@@ -15,52 +20,65 @@ pub fn rust_param_raw(op: &Operand) -> String {
             }
         }
         OperandKind::RegMem(rm) => {
-            let reg = match rm.bits() {
-                128 => "Xmm",
-                _ => "Gpr",
-            };
+            let reg = rm.reg_class().unwrap();
             let aligned = if op.align { "Aligned" } else { "" };
             format!("&{reg}Mem{aligned}")
         }
         OperandKind::Mem(_) => {
             format!("&Amode")
         }
-        OperandKind::Reg(r) => match r.bits() {
-            128 => "Xmm".to_string(),
-            _ => "Gpr".to_string(),
-        },
-        OperandKind::FixedReg(_) => "Gpr".to_string(),
+        OperandKind::Reg(r) | OperandKind::FixedReg(r) => r.reg_class().unwrap().to_string(),
     }
 }
 
 /// Returns the conversion function, if any, when converting the ISLE type for
 /// this parameter to the assembler type for this parameter. Effectively
 /// converts `self.rust_param_raw()` to the assembler type.
-pub fn rust_convert_isle_to_assembler(op: &Operand) -> Option<&'static str> {
+pub fn rust_convert_isle_to_assembler(op: &Operand) -> String {
     match op.location.kind() {
-        OperandKind::Reg(r) => Some(match (r.bits(), op.mutability) {
-            (128, Mutability::Read) => "cranelift_assembler_x64::Xmm::new",
-            (128, Mutability::ReadWrite) => "self.convert_xmm_to_assembler_read_write_xmm",
-            (_, Mutability::Read) => "cranelift_assembler_x64::Gpr::new",
-            (_, Mutability::ReadWrite) => "self.convert_gpr_to_assembler_read_write_gpr",
-        }),
-        OperandKind::Mem(_) => Some("self.convert_amode_to_assembler_amode"),
-        OperandKind::RegMem(r) => Some(match (r.bits(), op.mutability) {
-            (128, Mutability::Read) => "self.convert_xmm_mem_to_assembler_read_xmm_mem",
-            (128, Mutability::ReadWrite) => "self.convert_xmm_mem_to_assembler_read_write_xmm_mem",
-            (_, Mutability::Read) => "self.convert_gpr_mem_to_assembler_read_gpr_mem",
-            (_, Mutability::ReadWrite) => "self.convert_gpr_mem_to_assembler_read_write_gpr_mem",
-        }),
-        OperandKind::Imm(loc) => match (op.extension.is_sign_extended(), loc.bits()) {
-            (true, 8) => Some("cranelift_assembler_x64::Simm8::new"),
-            (true, 16) => Some("cranelift_assembler_x64::Simm16::new"),
-            (true, 32) => Some("cranelift_assembler_x64::Simm32::new"),
-            (false, 8) => Some("cranelift_assembler_x64::Imm8::new"),
-            (false, 16) => Some("cranelift_assembler_x64::Imm16::new"),
-            (false, 32) => Some("cranelift_assembler_x64::Imm32::new"),
-            _ => None,
-        },
-        OperandKind::FixedReg(_) => None,
+        OperandKind::Imm(loc) => {
+            let bits = loc.bits();
+            let ty = if op.extension.is_sign_extended() {
+                "Simm"
+            } else {
+                "Imm"
+            };
+            format!("{ASM}::{ty}{bits}::new({loc})")
+        }
+        OperandKind::FixedReg(r) => {
+            let reg = r.reg_class().unwrap().to_string().to_lowercase();
+            match op.mutability {
+                Mutability::Read => format!("{ASM}::Fixed({r})"),
+                Mutability::Write => {
+                    format!("{ASM}::Fixed(self.temp_writable_{reg}())")
+                }
+                Mutability::ReadWrite => {
+                    format!("self.convert_{reg}_to_assembler_fixed_read_write_{reg}({r})")
+                }
+            }
+        }
+        OperandKind::Reg(r) => {
+            let reg = r.reg_class().unwrap();
+            let reg_lower = reg.to_string().to_lowercase();
+            match op.mutability {
+                Mutability::Read => {
+                    format!("{ASM}::{reg}::new({r})")
+                }
+                Mutability::Write => {
+                    format!("{ASM}::{reg}::new(self.temp_writable_{reg_lower}())")
+                }
+                Mutability::ReadWrite => {
+                    format!("self.convert_{reg_lower}_to_assembler_read_write_{reg_lower}({r})")
+                }
+            }
+        }
+        OperandKind::RegMem(rm) => {
+            let reg = rm.reg_class().unwrap().to_string().to_lowercase();
+            let mut_ = op.mutability.generate_snake_case();
+            let align = if op.align { "_aligned" } else { "" };
+            format!("self.convert_{reg}_mem_to_assembler_{mut_}_{reg}_mem{align}({rm})")
+        }
+        OperandKind::Mem(mem) => format!("self.convert_amode_to_assembler_amode({mem})"),
     }
 }
 
@@ -71,47 +89,36 @@ pub fn rust_convert_isle_to_assembler(op: &Operand) -> Option<&'static str> {
 /// This function panics if the instruction has no operands.
 pub fn generate_macro_inst_fn(f: &mut Formatter, inst: &Inst) {
     let struct_name = inst.name();
-    let params = inst
-        .format
-        .operands
-        .iter()
-        .filter(|o| o.mutability.is_read())
-        // FIXME(#10238) don't filter out fixed regs here
-        .filter(|o| !matches!(o.location.kind(), OperandKind::FixedReg(_)))
-        .collect::<Vec<_>>();
+    let operands = inst.format.operands.iter().collect::<Vec<_>>();
     let results = inst
         .format
         .operands
         .iter()
         .filter(|o| o.mutability.is_write())
         .collect::<Vec<_>>();
-    let rust_params = params
+    let rust_params = operands
         .iter()
+        .filter(|o| o.mutability.is_read())
         .map(|o| format!("{}: {}", o.location, rust_param_raw(o)))
         .collect::<Vec<_>>()
         .join(", ");
     f.add_block(
         &format!("fn x64_{struct_name}_raw(&mut self, {rust_params}) -> AssemblerOutputs"),
         |f| {
-            for o in params.iter() {
-                let l = o.location;
-                match rust_convert_isle_to_assembler(o) {
-                    Some(cvt) => fmtln!(f, "let {l} = {cvt}({l});"),
-                    None => fmtln!(f, "let {l} = {l}.clone();"),
-                }
+            for op in operands.iter() {
+                let loc = op.location;
+                let cvt = rust_convert_isle_to_assembler(op);
+                fmtln!(f, "let {loc} = {cvt};");
             }
-            let args = params
+            let args = operands
                 .iter()
                 .map(|o| format!("{}.clone()", o.location))
                 .collect::<Vec<_>>();
             let args = args.join(", ");
             fmtln!(
                 f,
-                "let inst = cranelift_assembler_x64::inst::{struct_name}::new({args}).into();"
+                "let inst = {ASM}::inst::{struct_name}::new({args}).into();"
             );
-            if let Some(OperandKind::FixedReg(_)) = results.first().map(|o| o.location.kind()) {
-                fmtln!(f, "#[allow(unused_variables, reason = \"FIXME(#10238): fixed register instructions have TODOs\")]");
-            }
             fmtln!(f, "let inst = MInst::External {{ inst }};");
 
             use cranelift_assembler_x64_meta::dsl::Mutability::*;
@@ -119,23 +126,27 @@ pub fn generate_macro_inst_fn(f: &mut Formatter, inst: &Inst) {
                 [] => fmtln!(f, "SideEffectNoResult::Inst(inst)"),
                 [one] => match one.mutability {
                     Read => unreachable!(),
+                    Write => match one.location.kind() {
+                        // One write-only register output? Output the
+                        // instruction and that register.
+                        OperandKind::Reg(r) => {
+                            let ty = r.reg_class().unwrap().to_string();
+                            let var = ty.to_lowercase();
+                            fmtln!(f, "let {var} = {r}.as_ref().to_reg();");
+                            fmtln!(f, "AssemblerOutputs::Ret{ty} {{ inst, {var} }}");
+                        }
+                        _ => unimplemented!(),
+                    },
                     ReadWrite => match one.location.kind() {
                         OperandKind::Imm(_) => unreachable!(),
-                        // FIXME(#10238)
-                        OperandKind::FixedReg(_) => fmtln!(f, "todo!()"),
                         // One read/write register output? Output the instruction
                         // and that register.
-                        OperandKind::Reg(r) => {
-                            let (var, ty) = match r.bits() {
-                                128 => ("xmm", "Xmm"),
-                                _ => ("gpr", "Gpr"),
-                            };
-                            fmtln!(
-                                f,
-                                "let {var} = {r}.as_ref().write.to_reg();",
-                            );
+                        OperandKind::Reg(r) | OperandKind::FixedReg(r) => {
+                            let ty = r.reg_class().unwrap().to_string();
+                            let var = ty.to_lowercase();
+                            fmtln!(f, "let {var} = {r}.as_ref().write.to_reg();",);
                             fmtln!(f, "AssemblerOutputs::Ret{ty} {{ inst, {var} }}");
-                        },
+                        }
                         // One read/write memory operand? Output a side effect.
                         OperandKind::Mem(_) => {
                             fmtln!(f, "AssemblerOutputs::SideEffect {{ inst }}")
@@ -145,10 +156,8 @@ pub fn generate_macro_inst_fn(f: &mut Formatter, inst: &Inst) {
                         // emitted (e.g. the mem variant or the register variant).
                         OperandKind::RegMem(rm) => {
                             assert_eq!(results.len(), 1);
-                            let (var, ty) = match rm.bits() {
-                                128 => ("xmm", "Xmm"),
-                                _ => ("gpr", "Gpr"),
-                            };
+                            let ty = rm.reg_class().unwrap().to_string();
+                            let var = ty.to_lowercase();
                             f.add_block(&format!("match {rm}"), |f| {
                                 f.add_block(&format!("asm::{ty}Mem::{ty}(reg) => "), |f| {
                                     fmtln!(f, "let {var} = reg.write.to_reg();");
@@ -195,11 +204,7 @@ pub fn isle_param_raw(op: &Operand) -> String {
                 format!("u{bits}")
             }
         }
-        OperandKind::Reg(r) => match r.bits() {
-            128 => "Xmm".to_string(),
-            _ => "Gpr".to_string(),
-        },
-        OperandKind::FixedReg(_) => "Gpr".to_string(),
+        OperandKind::Reg(r) | OperandKind::FixedReg(r) => r.reg_class().unwrap().to_string(),
         OperandKind::Mem(_) => {
             if op.align {
                 unimplemented!("no way yet to mark an Amode as aligned")
@@ -208,10 +213,7 @@ pub fn isle_param_raw(op: &Operand) -> String {
             }
         }
         OperandKind::RegMem(rm) => {
-            let reg = match rm.bits() {
-                128 => "Xmm",
-                _ => "Gpr",
-            };
+            let reg = rm.reg_class().unwrap();
             let aligned = if op.align { "Aligned" } else { "" };
             format!("{reg}Mem{aligned}")
         }
@@ -308,22 +310,21 @@ pub fn isle_constructors(format: &Format) -> Vec<IsleConstructor> {
             [] => unimplemented!("if you truly need this (and not a `SideEffect*`), add a `NoReturn` variant to `AssemblerOutputs`"),
             [one] => match one.mutability {
                 Read => unreachable!(),
-                ReadWrite => match one.location.kind() {
+                ReadWrite | Write => match one.location.kind() {
                     Imm(_) => unreachable!(),
-                    FixedReg(_) => vec![IsleConstructor::RetGpr],
                     // One read/write register output? Output the instruction
                     // and that register.
-                    Reg(r) => match r.bits() {
-                        128 => vec![IsleConstructor::RetXmm],
-                        _ => vec![IsleConstructor::RetGpr],
+                    Reg(r) | FixedReg(r) => match r.reg_class().unwrap() {
+                        RegClass::Xmm => vec![IsleConstructor::RetXmm],
+                        RegClass::Gpr => vec![IsleConstructor::RetGpr],
                     },
                     // One read/write memory operand? Output a side effect.
                     Mem(_) => vec![IsleConstructor::RetMemorySideEffect],
                     // One read/write reg-mem output? We need constructors for
                     // both variants.
-                    RegMem(rm) => match rm.bits() {
-                        128 => vec![IsleConstructor::RetXmm, IsleConstructor::RetMemorySideEffect],
-                        _ => vec![IsleConstructor::RetGpr, IsleConstructor::RetMemorySideEffect],
+                    RegMem(rm) => match rm.reg_class().unwrap() {
+                        RegClass::Xmm => vec![IsleConstructor::RetXmm, IsleConstructor::RetMemorySideEffect],
+                        RegClass::Gpr => vec![IsleConstructor::RetGpr, IsleConstructor::RetMemorySideEffect],
                     },
                 }
             },
@@ -371,8 +372,6 @@ pub fn generate_isle_inst_decls(f: &mut Formatter, inst: &Inst) {
         .operands
         .iter()
         .filter(|o| o.mutability.is_read())
-        // FIXME(#10238) don't filter out fixed regs here
-        .filter(|o| !matches!(o.location.kind(), OperandKind::FixedReg(_)))
         .collect::<Vec<_>>();
     let raw_param_tys = params
         .iter()

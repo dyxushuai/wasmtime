@@ -104,6 +104,7 @@ mod component;
 #[cfg(feature = "component-model-async")]
 pub(crate) mod concurrent;
 mod func;
+mod get_host;
 mod instance;
 mod linker;
 mod matching;
@@ -121,6 +122,7 @@ pub use self::concurrent::{
 pub use self::func::{
     ComponentNamedList, ComponentType, Func, Lift, Lower, TypedFunc, WasmList, WasmStr,
 };
+pub use self::get_host::GetHost;
 pub use self::instance::{Instance, InstanceExportLookup, InstancePre};
 pub use self::linker::{Linker, LinkerInstance};
 pub use self::resource_table::{ResourceTable, ResourceTableError};
@@ -352,13 +354,13 @@ pub(crate) use self::store::ComponentStoreData;
 ///         // This can be used to indicate that entire interfaces have
 ///         // bindings generated elsewhere with a path pointing to the
 ///         // bindinges-generated module.
-///         "wasi:random/random": wasmtime_wasi::bindings::random::random,
+///         "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
 ///
 ///         // Similarly entire packages can also be specified.
-///         "wasi:cli": wasmtime_wasi::bindings::cli,
+///         "wasi:cli": wasmtime_wasi::p2::bindings::cli,
 ///
 ///         // Or, if applicable, entire namespaces can additionally be mapped.
-///         "wasi": wasmtime_wasi::bindings,
+///         "wasi": wasmtime_wasi::p2::bindings,
 ///
 ///         // Versions are supported if multiple versions are in play:
 ///         "wasi:http/types@0.2.0": wasmtime_wasi_http::bindings::http::types,

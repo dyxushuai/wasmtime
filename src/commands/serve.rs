@@ -1,6 +1,8 @@
 use crate::common::{Profile, RunCommon, RunTarget};
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
+use http::{Response, StatusCode};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Instant;
 use std::{
@@ -14,8 +16,8 @@ use std::{
 use tokio::sync::Notify;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Engine, Store, StoreLimits, UpdateDeadline};
-use wasmtime_wasi::{IoView, StreamError, StreamResult, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi::p2::{IoView, StreamError, StreamResult, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
 use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{
@@ -274,7 +276,7 @@ impl ServeCommand {
         // uses.
         if cli == Some(true) {
             let link_options = self.run.compute_wasi_features();
-            wasmtime_wasi::add_to_linker_with_options_async(linker, &link_options)?;
+            wasmtime_wasi::p2::add_to_linker_with_options_async(linker, &link_options)?;
             wasmtime_wasi_http::add_only_http_to_linker_async(linker)?;
         } else {
             wasmtime_wasi_http::add_to_linker_async(linker)?;
@@ -432,7 +434,28 @@ impl ServeCommand {
                     .serve_connection(
                         stream,
                         hyper::service::service_fn(move |req| {
-                            handle_request(h.clone(), req, comp.clone())
+                            let comp = comp.clone();
+                            let h = h.clone();
+                            async move {
+                                use http_body_util::{BodyExt, Full};
+                                fn to_errorcode(_: Infallible) -> ErrorCode {
+                                    unreachable!()
+                                }
+                                match handle_request(h, req, comp).await {
+                                    Ok(r) => Ok::<_, Infallible>(r),
+                                    Err(e) => {
+                                        eprintln!("error: {e:?}");
+                                        Ok(Response::builder()
+                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(
+                                                Full::new(bytes::Bytes::new())
+                                                    .map_err(to_errorcode)
+                                                    .boxed(),
+                                            )
+                                            .unwrap())
+                                    }
+                                }
+                            }
                         }),
                     )
                     .await
@@ -792,8 +815,8 @@ impl LogStream {
     }
 }
 
-impl wasmtime_wasi::StdoutStream for LogStream {
-    fn stream(&self) -> Box<dyn wasmtime_wasi::OutputStream> {
+impl wasmtime_wasi::p2::StdoutStream for LogStream {
+    fn stream(&self) -> Box<dyn wasmtime_wasi::p2::OutputStream> {
         Box::new(self.clone())
     }
 
@@ -807,7 +830,7 @@ impl wasmtime_wasi::StdoutStream for LogStream {
     }
 }
 
-impl wasmtime_wasi::OutputStream for LogStream {
+impl wasmtime_wasi::p2::OutputStream for LogStream {
     fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
         let mut bytes = &bytes[..];
 
@@ -849,7 +872,7 @@ impl wasmtime_wasi::OutputStream for LogStream {
 }
 
 #[async_trait::async_trait]
-impl wasmtime_wasi::Pollable for LogStream {
+impl wasmtime_wasi::p2::Pollable for LogStream {
     async fn ready(&mut self) {}
 }
 

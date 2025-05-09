@@ -13,7 +13,7 @@ use crate::{
 
 use cranelift_codegen::isa::aarch64::inst::{ASIMDFPModImm, FpuToIntOp, UImm5, NZCV};
 use cranelift_codegen::{
-    ir::{ExternalName, LibCall, MemFlags, SourceLoc, TrapCode, UserExternalNameRef},
+    ir::{ExternalName, MemFlags, SourceLoc, TrapCode, UserExternalNameRef},
     isa::aarch64::inst::{
         self,
         emit::{EmitInfo, EmitState},
@@ -842,18 +842,18 @@ impl Assembler {
         });
     }
 
-    // If the condition is true, Conditional Select writes rm to rd. If the condition is false,
-    // it writes rn to rd
-    pub fn csel(&mut self, rm: Reg, rn: Reg, rd: WritableReg, cond: Cond) {
+    /// If the condition is true, `csel` writes rn to rd. If the
+    /// condition is false, it writes rm to rd
+    pub fn csel(&mut self, rn: Reg, rm: Reg, rd: WritableReg, cond: Cond) {
         self.emit(Inst::CSel {
             rd: rd.map(Into::into),
-            rm: rm.into(),
             rn: rn.into(),
+            rm: rm.into(),
             cond,
         });
     }
 
-    // Population Count per byte.
+    /// Population count per byte.
     pub fn cnt(&mut self, rd: WritableReg) {
         self.emit(Inst::VecMisc {
             op: VecMisc2::Cnt,
@@ -1091,18 +1091,6 @@ impl Assembler {
                 call_conv.into(),
             )),
         })
-    }
-
-    /// Emit a call to a well-known libcall.
-    /// `dst` is used as a scratch register to hold the address of the libcall function.
-    pub fn call_with_lib(&mut self, lib: LibCall, dst: Reg, call_conv: CallingConvention) {
-        let name = ExternalName::LibCall(lib);
-        self.emit(Inst::LoadExtName {
-            rd: writable!(dst.into()),
-            name: name.into(),
-            offset: 0,
-        });
-        self.call_with_reg(dst, call_conv)
     }
 
     /// Load the min value for an integer of size out_size, as a floating-point
