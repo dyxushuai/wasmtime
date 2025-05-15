@@ -96,8 +96,7 @@ struct ExportField {
     ty: String,
     ty_index: String,
     load: String,
-    get_index_from_component: String,
-    get_index_from_instance: String,
+    get_index: String,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -613,26 +612,36 @@ impl Wasmtime {
         let ty;
         let ty_index;
         let load;
-        let get_index_from_component;
-        let get_index_from_instance;
+        let get_index;
         match item {
             WorldItem::Function(func) => {
                 generator.define_rust_guest_export(resolve, None, func);
                 let body = mem::take(&mut generator.src).into();
                 load = generator.extract_typed_function(func).1;
                 assert!(generator.src.is_empty());
-                self.exports.funcs.push(body);
+                generator.generator.exports.funcs.push(body);
                 ty_index = format!("{wt}::component::ComponentExportIndex");
                 field = func_field_name(resolve, func);
                 ty = format!("{wt}::component::Func");
-                get_index_from_component = format!(
-                    "_component.export_index(None, \"{}\")
-                        .ok_or_else(|| anyhow::anyhow!(\"no function export `{0}` found\"))?.1",
+                let sig = generator.typedfunc_sig(func, TypeMode::AllBorrowed("'_"));
+                let typecheck = format!(
+                    "match item {{
+                            {wt}::component::types::ComponentItem::ComponentFunc(func) => {{
+                                anyhow::Context::context(
+                                    func.typecheck::<{sig}>(&_instance_type),
+                                    \"type-checking export func `{0}`\"
+                                )?;
+                                index
+                            }}
+                            _ => Err(anyhow::anyhow!(\"export `{0}` is not a function\"))?,
+                        }}",
                     func.name
                 );
-                get_index_from_instance = format!(
-                    "_instance.get_export(&mut store, None, \"{}\")
-                        .ok_or_else(|| anyhow::anyhow!(\"no function export `{0}` found\"))?",
+                get_index = format!(
+                    "{{ let (item, index) = _component.get_export(None, \"{}\")
+                        .ok_or_else(|| anyhow::anyhow!(\"no export `{0}` found\"))?;
+                        {typecheck}
+                     }}",
                     func.name
                 );
             }
@@ -683,35 +692,13 @@ impl Wasmtime {
 ///
 /// This constructor can be used to front-load string lookups to find exports
 /// within a component.
-pub fn new(
-    component: &{wt}::component::Component,
+pub fn new<_T>(
+    _instance_pre: &{wt}::component::InstancePre<_T>,
 ) -> {wt}::Result<{struct_name}Indices> {{
-    let (_, instance) = component.export_index(None, \"{instance_name}\")
+    let instance = _instance_pre.component().get_export_index(None, \"{instance_name}\")
         .ok_or_else(|| anyhow::anyhow!(\"no exported instance named `{instance_name}`\"))?;
-    Self::_new(|name| {{
-        component.export_index(Some(&instance), name)
-            .map(|p| p.1)
-    }})
-}}
-
-/// This constructor is similar to [`{struct_name}Indices::new`] except that it
-/// performs string lookups after instantiation time.
-pub fn new_instance(
-    mut store: impl {wt}::AsContextMut,
-    instance: &{wt}::component::Instance,
-) -> {wt}::Result<{struct_name}Indices> {{
-    let instance_export = instance.get_export(&mut store, None, \"{instance_name}\")
-        .ok_or_else(|| anyhow::anyhow!(\"no exported instance named `{instance_name}`\"))?;
-    Self::_new(|name| {{
-        instance.get_export(&mut store, Some(&instance_export), name)
-    }})
-}}
-
-fn _new(
-    mut lookup: impl FnMut (&str) -> Option<{wt}::component::ComponentExportIndex>,
-) -> {wt}::Result<{struct_name}Indices> {{
     let mut lookup = move |name| {{
-        lookup(name).ok_or_else(|| {{
+        _instance_pre.component().get_export_index(Some(&instance), name).ok_or_else(|| {{
             anyhow::anyhow!(
                 \"instance export `{instance_name}` does \\
                   not have export `{{name}}`\"
@@ -742,9 +729,11 @@ fn _new(
                             mut store: impl {wt}::AsContextMut,
                             instance: &{wt}::component::Instance,
                         ) -> {wt}::Result<{struct_name}> {{
+                            let _instance = instance;
+                            let _instance_pre = _instance.instance_pre(&store);
+                            let _instance_type = _instance_pre.instance_type();
                             let mut store = store.as_context_mut();
                             let _ = &mut store;
-                            let _instance = instance;
                     "
                 );
                 let mut fields = Vec::new();
@@ -849,9 +838,7 @@ fn _new(
                 ));
                 ty_index = format!("{path}Indices");
                 ty = path;
-                get_index_from_component = format!("{ty_index}::new(_component)?");
-                get_index_from_instance =
-                    format!("{ty_index}::new_instance(&mut store, _instance)?");
+                get_index = format!("{ty_index}::new(_instance_pre)?");
             }
         }
         let prev = self.exports.fields.insert(
@@ -860,8 +847,7 @@ fn _new(
                 ty,
                 ty_index,
                 load,
-                get_index_from_component,
-                get_index_from_instance,
+                get_index,
             },
         );
         assert!(prev.is_none());
@@ -887,12 +873,12 @@ fn _new(
 /// has been created through a [`Linker`]({wt}::component::Linker).
 ///
 /// For more information see [`{camel}`] as well.
-pub struct {camel}Pre<T> {{
+pub struct {camel}Pre<T: 'static> {{
     instance_pre: {wt}::component::InstancePre<T>,
     indices: {camel}Indices,
 }}
 
-impl<T> Clone for {camel}Pre<T> {{
+impl<T: 'static> Clone for {camel}Pre<T> {{
     fn clone(&self) -> Self {{
         Self {{
             instance_pre: self.instance_pre.clone(),
@@ -901,14 +887,14 @@ impl<T> Clone for {camel}Pre<T> {{
     }}
 }}
 
-impl<_T> {camel}Pre<_T> {{
+impl<_T: 'static> {camel}Pre<_T> {{
     /// Creates a new copy of `{camel}Pre` bindings which can then
     /// be used to instantiate into a particular store.
     ///
     /// This method may fail if the component behind `instance_pre`
     /// does not have the required exports.
     pub fn new(instance_pre: {wt}::component::InstancePre<_T>) -> {wt}::Result<Self> {{
-        let indices = {camel}Indices::new(instance_pre.component())?;
+        let indices = {camel}Indices::new(&instance_pre)?;
         Ok(Self {{ instance_pre, indices }})
     }}
 
@@ -981,11 +967,6 @@ impl<_T> {camel}Pre<_T> {{
                 /// * If you've instantiated the instance yourself already
                 ///   then you can use [`{camel}::new`].
                 ///
-                /// * You can also access the guts of instantiation through
-                ///   [`{camel}Indices::new_instance`] followed
-                ///   by [`{camel}Indices::load`] to crate an instance of this
-                ///   type.
-                ///
                 /// These methods are all equivalent to one another and move
                 /// around the tradeoff of what work is performed when.
                 ///
@@ -1018,12 +999,13 @@ impl<_T> {camel}Pre<_T> {{
                 ///
                 /// This method may fail if the component does not have the
                 /// required exports.
-                pub fn new(component: &{wt}::component::Component) -> {wt}::Result<Self> {{
-                    let _component = component;
+                pub fn new<_T>(_instance_pre: &{wt}::component::InstancePre<_T>) -> {wt}::Result<Self> {{
+                    let _component = _instance_pre.component();
+                    let _instance_type = _instance_pre.instance_type();
             ",
         );
         for (name, field) in self.exports.fields.iter() {
-            uwriteln!(self.src, "let {name} = {};", field.get_index_from_component);
+            uwriteln!(self.src, "let {name} = {};", field.get_index);
         }
         uwriteln!(self.src, "Ok({camel}Indices {{");
         for (name, _) in self.exports.fields.iter() {
@@ -1031,33 +1013,6 @@ impl<_T> {camel}Pre<_T> {{
         }
         uwriteln!(self.src, "}})");
         uwriteln!(self.src, "}}"); // close `fn new`
-
-        uwriteln!(
-            self.src,
-            "
-                /// Creates a new instance of [`{camel}Indices`] from an
-                /// instantiated component.
-                ///
-                /// This method of creating a [`{camel}`] will perform string
-                /// lookups for all exports when this method is called. This
-                /// will only succeed if the provided instance matches the
-                /// requirements of [`{camel}`].
-                pub fn new_instance(
-                    mut store: impl {wt}::AsContextMut,
-                    instance: &{wt}::component::Instance,
-                ) -> {wt}::Result<Self> {{
-                    let _instance = instance;
-            ",
-        );
-        for (name, field) in self.exports.fields.iter() {
-            uwriteln!(self.src, "let {name} = {};", field.get_index_from_instance);
-        }
-        uwriteln!(self.src, "Ok({camel}Indices {{");
-        for (name, _) in self.exports.fields.iter() {
-            uwriteln!(self.src, "{name},");
-        }
-        uwriteln!(self.src, "}})");
-        uwriteln!(self.src, "}}"); // close `fn new_instance`
 
         uwriteln!(
             self.src,
@@ -1072,6 +1027,7 @@ impl<_T> {camel}Pre<_T> {{
                     mut store: impl {wt}::AsContextMut,
                     instance: &{wt}::component::Instance,
                 ) -> {wt}::Result<{camel}> {{
+                    let _ = &mut store;
                     let _instance = instance;
             ",
         );
@@ -1092,7 +1048,7 @@ impl<_T> {camel}Pre<_T> {{
                 /// Convenience wrapper around [`{camel}Pre::new`] and
                 /// [`{camel}Pre::instantiate{async__}`].
                 pub {async_} fn instantiate{async__}<_T>(
-                    mut store: impl {wt}::AsContextMut<Data = _T>,
+                    store: impl {wt}::AsContextMut<Data = _T>,
                     component: &{wt}::component::Component,
                     linker: &{wt}::component::Linker<_T>,
                 ) -> {wt}::Result<{camel}>
@@ -1102,14 +1058,14 @@ impl<_T> {camel}Pre<_T> {{
                     {camel}Pre::new(pre)?.instantiate{async__}(store){await_}
                 }}
 
-                /// Convenience wrapper around [`{camel}Indices::new_instance`] and
+                /// Convenience wrapper around [`{camel}Indices::new`] and
                 /// [`{camel}Indices::load`].
                 pub fn new(
                     mut store: impl {wt}::AsContextMut,
                     instance: &{wt}::component::Instance,
                 ) -> {wt}::Result<{camel}> {{
-                    let indices = {camel}Indices::new_instance(&mut store, instance)?;
-                    indices.load(store, instance)
+                    let indices = {camel}Indices::new(&instance.instance_pre(&store))?;
+                    indices.load(&mut store, instance)
                 }}
             ",
         );
@@ -1467,37 +1423,6 @@ impl Wasmtime {
         }
         uwriteln!(self.src, "}}");
 
-        let get_host_bounds = if let CallStyle::Concurrent = self.opts.call_style() {
-            let constraints = world_imports_concurrent_constraints(resolve, world, &self.opts);
-
-            format!("{world_camel}Imports{}", constraints("D"))
-        } else {
-            format!("{world_camel}Imports")
-        };
-
-        uwriteln!(
-            self.src,
-            "
-                pub trait {world_camel}ImportsGetHost<T, D>:
-                    Fn(T) -> <Self as {world_camel}ImportsGetHost<T, D>>::Host
-                        + Send
-                        + Sync
-                        + Copy
-                        + 'static
-                {{
-                    type Host: {get_host_bounds};
-                }}
-
-                impl<F, T, D, O> {world_camel}ImportsGetHost<T, D> for F
-                where
-                    F: Fn(T) -> O + Send + Sync + Copy + 'static,
-                    O: {get_host_bounds},
-                {{
-                    type Host = O;
-                }}
-            "
-        );
-
         // Generate impl WorldImports for &mut WorldImports
         let maybe_send = if let CallStyle::Async = self.opts.call_style() {
             "+ Send"
@@ -1607,13 +1532,9 @@ impl Wasmtime {
         let camel = to_rust_upper_camel_case(&resolve.worlds[world].name);
 
         let data_bounds = if self.opts.is_store_data_send() {
-            if let CallStyle::Concurrent = self.opts.call_style() {
-                "T: Send + 'static,"
-            } else {
-                "T: Send,"
-            }
+            "Send + 'static"
         } else {
-            ""
+            "'static"
         };
         let wt = self.wasmtime_path();
         if has_world_imports_trait {
@@ -1628,15 +1549,15 @@ impl Wasmtime {
             uwrite!(
                 self.src,
                 "
-                    pub fn add_to_linker_imports_get_host<
-                        T,
-                        G: for<'a> {camel}ImportsGetHost<&'a mut T, T, Host: {host_bounds}>
-                    >(
+                    pub fn add_to_linker_imports<T, D>(
                         linker: &mut {wt}::component::Linker<T>,
                         {options_param}
-                        host_getter: G,
+                        host_getter: fn(&mut T) -> D::Data<'_>,
                     ) -> {wt}::Result<()>
-                        where {data_bounds}
+                        where
+                            D: {wt}::component::HasData,
+                            for<'a> D::Data<'a>: {host_bounds},
+                            T: {data_bounds}
                     {{
                         let mut linker = linker.root();
                 "
@@ -1697,68 +1618,64 @@ impl Wasmtime {
                 .collect::<Vec<_>>()
                 .concat();
 
-            (
-                format!("U: Send{bounds}"),
-                format!("T: Send{bounds} + 'static,"),
-            )
+            (format!("Send{bounds}"), format!("Send{bounds} + 'static,"))
         } else {
             (
-                format!("U: {}", self.world_host_traits(resolve, world).join(" + ")),
+                format!("{}", self.world_host_traits(resolve, world).join(" + ")),
                 data_bounds.to_string(),
             )
         };
 
-        if !self.opts.skip_mut_forwarding_impls {
+        uwriteln!(
+            self.src,
+            "
+                pub fn add_to_linker<T, D>(
+                    linker: &mut {wt}::component::Linker<T>,
+                    {options_param}
+                    get: fn(&mut T) -> D::Data<'_>,
+                ) -> {wt}::Result<()>
+                    where
+                        D: {wt}::component::HasData,
+                        for<'a> D::Data<'a>: {host_bounds},
+                        T: {data_bounds}
+                {{
+            "
+        );
+        let gate = FeatureGate::open(&mut self.src, &resolve.worlds[world].stability);
+        if has_world_imports_trait {
             uwriteln!(
                 self.src,
-                "
-                    pub fn add_to_linker<T, U>(
-                        linker: &mut {wt}::component::Linker<T>,
-                        {options_param}
-                        get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
-                    ) -> {wt}::Result<()>
-                        where
-                            {data_bounds}
-                            {host_bounds}
-                    {{
-                "
+                "Self::add_to_linker_imports::<T, D>(linker {options_arg}, get)?;"
             );
-            let gate = FeatureGate::open(&mut self.src, &resolve.worlds[world].stability);
-            if has_world_imports_trait {
-                uwriteln!(
-                    self.src,
-                    "Self::add_to_linker_imports_get_host(linker {options_arg}, get)?;"
-                );
-            }
-            for (interface_id, path) in self.import_interface_paths() {
-                let options_arg = if self.interface_link_options[&interface_id].has_any() {
-                    ", &options.into()"
-                } else {
-                    ""
-                };
-
-                let import_stability = resolve.worlds[world]
-                    .imports
-                    .iter()
-                    .filter_map(|(_, i)| match i {
-                        WorldItem::Interface { id, stability } if *id == interface_id => {
-                            Some(stability.clone())
-                        }
-                        _ => None,
-                    })
-                    .next()
-                    .unwrap_or(Stability::Unknown);
-
-                let gate = FeatureGate::open(&mut self.src, &import_stability);
-                uwriteln!(
-                    self.src,
-                    "{path}::add_to_linker(linker {options_arg}, get)?;"
-                );
-                gate.close(&mut self.src);
-            }
-            gate.close(&mut self.src);
-            uwriteln!(self.src, "Ok(())\n}}");
         }
+        for (interface_id, path) in self.import_interface_paths() {
+            let options_arg = if self.interface_link_options[&interface_id].has_any() {
+                ", &options.into()"
+            } else {
+                ""
+            };
+
+            let import_stability = resolve.worlds[world]
+                .imports
+                .iter()
+                .filter_map(|(_, i)| match i {
+                    WorldItem::Interface { id, stability } if *id == interface_id => {
+                        Some(stability.clone())
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or(Stability::Unknown);
+
+            let gate = FeatureGate::open(&mut self.src, &import_stability);
+            uwriteln!(
+                self.src,
+                "{path}::add_to_linker::<T, D>(linker {options_arg}, get)?;"
+            );
+            gate.close(&mut self.src);
+        }
+        gate.close(&mut self.src);
+        uwriteln!(self.src, "Ok(())\n}}");
     }
 
     fn generate_add_resource_to_linker(
@@ -1848,6 +1765,7 @@ impl<'a> InterfaceGenerator<'a> {
             TypeDefKind::Handle(handle) => self.type_handle(id, name, handle, &ty.docs),
             TypeDefKind::Resource => self.type_resource(id, name, ty, &ty.docs),
             TypeDefKind::Unknown => unreachable!(),
+            TypeDefKind::FixedSizeList(..) => todo!(),
         }
     }
 
@@ -2707,7 +2625,7 @@ impl<'a> InterfaceGenerator<'a> {
         let (data_bounds, mut host_bounds, mut get_host_bounds) =
             match self.generator.opts.call_style() {
                 CallStyle::Async => (
-                    "T: Send,".to_string(),
+                    "Send + 'static,",
                     "Host + Send".to_string(),
                     "Host + Send".to_string(),
                 ),
@@ -2720,12 +2638,12 @@ impl<'a> InterfaceGenerator<'a> {
                     );
 
                     (
-                        "T: Send + 'static,".to_string(),
+                        "Send + 'static,",
                         format!("Host{} + Send", constraints("T")),
                         format!("Host{} + Send", constraints("D")),
                     )
                 }
-                CallStyle::Sync => (String::new(), "Host".to_string(), "Host".to_string()),
+                CallStyle::Sync => ("'static", "Host".to_string(), "Host".to_string()),
             };
 
         for ty in required_conversion_traits {
@@ -2733,39 +2651,24 @@ impl<'a> InterfaceGenerator<'a> {
             uwrite!(get_host_bounds, " + {ty}");
         }
 
-        let (options_param, options_arg) = if self.generator.interface_link_options[&id].has_any() {
-            ("options: &LinkOptions,", ", options")
+        let options_param = if self.generator.interface_link_options[&id].has_any() {
+            "options: &LinkOptions,"
         } else {
-            ("", "")
+            ""
         };
 
         uwriteln!(
             self.src,
             "
-                pub trait GetHost<T, D>:
-                    Fn(T) -> <Self as GetHost<T, D>>::Host
-                        + Send
-                        + Sync
-                        + Copy
-                        + 'static
-                {{
-                    type Host: {get_host_bounds};
-                }}
-
-                impl<F, T, D, O> GetHost<T, D> for F
-                where
-                    F: Fn(T) -> O + Send + Sync + Copy + 'static,
-                    O: {get_host_bounds},
-                {{
-                    type Host = O;
-                }}
-
-                pub fn add_to_linker_get_host<T, G: for<'a> GetHost<&'a mut T, T, Host: {host_bounds}>>(
+                pub fn add_to_linker<T, D>(
                     linker: &mut {wt}::component::Linker<T>,
                     {options_param}
-                    host_getter: G,
+                    host_getter: fn(&mut T) -> D::Data<'_>,
                 ) -> {wt}::Result<()>
-                    where {data_bounds}
+                    where
+                        D: {wt}::component::HasData,
+                        for<'a> D::Data<'a>: {host_bounds},
+                        T: {data_bounds}
                 {{
             "
         );
@@ -2792,23 +2695,6 @@ impl<'a> InterfaceGenerator<'a> {
         uwriteln!(self.src, "}}");
 
         if !self.generator.opts.skip_mut_forwarding_impls {
-            // Generate add_to_linker (with closure)
-            uwriteln!(
-                self.src,
-                "
-                pub fn add_to_linker<T, U>(
-                    linker: &mut {wt}::component::Linker<T>,
-                    {options_param}
-                    get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
-                ) -> {wt}::Result<()>
-                    where
-                        U: {host_bounds}, {data_bounds}
-                {{
-                    add_to_linker_get_host(linker {options_arg}, get)
-                }}
-                "
-            );
-
             // Generate impl Host for &mut Host
             let maybe_send = if is_maybe_async { "+ Send" } else { "" };
 
@@ -3010,7 +2896,7 @@ impl<'a> InterfaceGenerator<'a> {
         if let CallStyle::Concurrent = &style {
             uwrite!(
                 self.src,
-                "let r = <G::Host as {host_trait}>::{func_name}(host, "
+                "let r = <D::Data<'_> as {host_trait}>::{func_name}(host, "
             );
         } else {
             uwrite!(self.src, "let r = {host_trait}::{func_name}(host, ");
@@ -3164,23 +3050,11 @@ impl<'a> InterfaceGenerator<'a> {
     }
 
     fn extract_typed_function(&mut self, func: &Function) -> (String, String) {
-        let prev = mem::take(&mut self.src);
         let snake = func_field_name(self.resolve, func);
-        uwrite!(self.src, "*_instance.get_typed_func::<(");
-        for (_, ty) in func.params.iter() {
-            self.print_ty(ty, TypeMode::AllBorrowed("'_"));
-            self.push_str(", ");
-        }
-        self.src.push_str("), (");
-        if let Some(ty) = func.result {
-            self.print_ty(&ty, TypeMode::Owned);
-            self.push_str(", ");
-        }
-        uwriteln!(self.src, ")>(&mut store, &self.{snake})?.func()");
-
-        let ret = (snake, mem::take(&mut self.src).to_string());
-        self.src = prev;
-        ret
+        let sig = self.typedfunc_sig(func, TypeMode::AllBorrowed("'_"));
+        let extract =
+            format!("*_instance.get_typed_func::<{sig}>(&mut store, &self.{snake})?.func()");
+        (snake, extract)
     }
 
     fn define_rust_guest_export(
@@ -3232,13 +3106,21 @@ impl<'a> InterfaceGenerator<'a> {
         if concurrent {
             uwrite!(self.src, ">");
         }
+        uwrite!(self.src, ">");
 
-        let maybe_static = if concurrent { " + 'static" } else { "" };
-
-        uwrite!(
-            self.src,
-            "> where <S as {wt}::AsContext>::Data: Send{maybe_static} {{\n"
-        );
+        match style {
+            CallStyle::Concurrent => {
+                uwrite!(
+                    self.src,
+                    " where <S as {wt}::AsContext>::Data: Send + 'static",
+                );
+            }
+            CallStyle::Async => {
+                uwrite!(self.src, " where <S as {wt}::AsContext>::Data: Send");
+            }
+            CallStyle::Sync => {}
+        }
+        uwrite!(self.src, "{{\n");
 
         // TODO: support tracing concurrent calls
         if self.generator.opts.tracing && !concurrent {
@@ -3272,23 +3154,18 @@ impl<'a> InterfaceGenerator<'a> {
         }
 
         self.src.push_str("let callee = unsafe {\n");
-        uwrite!(self.src, "{wt}::component::TypedFunc::<(");
-        for (_, ty) in func.params.iter() {
-            self.print_ty(ty, param_mode);
-            self.push_str(", ");
-        }
-        self.src.push_str("), (");
-        if let Some(ty) = func.result {
-            self.print_ty(&ty, TypeMode::Owned);
-            self.push_str(", ");
-        }
+        uwrite!(
+            self.src,
+            "{wt}::component::TypedFunc::<{}>",
+            self.typedfunc_sig(func, param_mode)
+        );
         let projection_to_func = match &func.kind {
             FunctionKind::Freestanding => "",
             _ => ".funcs",
         };
         uwriteln!(
             self.src,
-            ")>::new_unchecked(self{projection_to_func}.{})",
+            "::new_unchecked(self{projection_to_func}.{})",
             func_field_name(self.resolve, func),
         );
         self.src.push_str("};\n");
@@ -3647,6 +3524,7 @@ fn type_contains_lists(ty: Type, resolve: &Resolve) -> bool {
                 .any(|case| option_type_contains_lists(case.ty, resolve)),
             TypeDefKind::Type(ty) => type_contains_lists(*ty, resolve),
             TypeDefKind::List(_) => true,
+            TypeDefKind::FixedSizeList(..) => todo!(),
         },
 
         // Technically strings are lists too, but we ignore that here because

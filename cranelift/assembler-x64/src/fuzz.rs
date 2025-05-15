@@ -4,7 +4,9 @@
 //! throughout this crate to avoid depending on the `arbitrary` crate
 //! unconditionally (use the `fuzz` feature instead).
 
-use crate::{AmodeOffset, AmodeOffsetPlusKnownOffset, AsReg, Gpr, Inst, NonRspGpr, Registers, Xmm};
+use crate::{
+    AmodeOffset, AmodeOffsetPlusKnownOffset, AsReg, Fixed, Gpr, Inst, NonRspGpr, Registers, Xmm,
+};
 use arbitrary::{Arbitrary, Result, Unstructured};
 use capstone::{arch::x86, arch::BuildsCapstone, arch::BuildsCapstoneSyntax, Capstone};
 
@@ -173,8 +175,10 @@ pub struct FuzzRegs;
 impl Registers for FuzzRegs {
     type ReadGpr = FuzzReg;
     type ReadWriteGpr = FuzzReg;
+    type WriteGpr = FuzzReg;
     type ReadXmm = FuzzReg;
     type ReadWriteXmm = FuzzReg;
+    type WriteXmm = FuzzReg;
 }
 
 /// A simple `u8` register type for fuzzing only.
@@ -183,7 +187,7 @@ pub struct FuzzReg(u8);
 
 impl<'a> Arbitrary<'a> for FuzzReg {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(Self::new(u.int_in_range(0..=15)?))
+        Ok(Self(u.int_in_range(0..=15)?))
     }
 }
 
@@ -205,6 +209,13 @@ impl Arbitrary<'_> for AmodeOffsetPlusKnownOffset {
         })
     }
 }
+
+impl<R: AsReg, const E: u8> Arbitrary<'_> for Fixed<R, E> {
+    fn arbitrary(_: &mut Unstructured<'_>) -> Result<Self> {
+        Ok(Self::new(E))
+    }
+}
+
 impl<R: AsReg> Arbitrary<'_> for NonRspGpr<R> {
     fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
         use crate::gpr::enc::*;
@@ -231,8 +242,10 @@ pub trait RegistersArbitrary:
     Registers<
     ReadGpr: for<'a> Arbitrary<'a>,
     ReadWriteGpr: for<'a> Arbitrary<'a>,
+    WriteGpr: for<'a> Arbitrary<'a>,
     ReadXmm: for<'a> Arbitrary<'a>,
     ReadWriteXmm: for<'a> Arbitrary<'a>,
+    WriteXmm: for<'a> Arbitrary<'a>,
 >
 {
 }
@@ -242,8 +255,10 @@ where
     R: Registers,
     R::ReadGpr: for<'a> Arbitrary<'a>,
     R::ReadWriteGpr: for<'a> Arbitrary<'a>,
+    R::WriteGpr: for<'a> Arbitrary<'a>,
     R::ReadXmm: for<'a> Arbitrary<'a>,
     R::ReadWriteXmm: for<'a> Arbitrary<'a>,
+    R::WriteXmm: for<'a> Arbitrary<'a>,
 {
 }
 

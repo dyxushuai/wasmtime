@@ -11,13 +11,14 @@ use crate::ir::pcc::{Fact, FactContext, PccError, PccResult};
 use crate::ir::{
     ArgumentPurpose, Block, BlockArg, Constant, ConstantData, DataFlowGraph, ExternalName,
     Function, GlobalValue, GlobalValueData, Immediate, Inst, InstructionData, MemFlags,
-    RelSourceLoc, Type, Value, ValueDef, ValueLabelAssignments, ValueLabelStart,
+    RelSourceLoc, SigRef, Signature, Type, Value, ValueDef, ValueLabelAssignments, ValueLabelStart,
 };
 use crate::machinst::valueregs::InvalidSentinel;
 use crate::machinst::{
     writable_value_regs, ABIMachineSpec, BackwardsInsnIndex, BlockIndex, BlockLoweringOrder,
-    Callee, InsnIndex, LoweredBlock, MachLabel, Reg, SigSet, VCode, VCodeBuilder, VCodeConstant,
-    VCodeConstantData, VCodeConstants, VCodeInst, ValueRegs, Writable,
+    CallArgList, CallInfo, CallRetList, Callee, InsnIndex, LoweredBlock, MachLabel, Reg, Sig,
+    SigSet, TryCallInfo, VCode, VCodeBuilder, VCodeConstant, VCodeConstantData, VCodeConstants,
+    VCodeInst, ValueRegs, Writable,
 };
 use crate::settings::Flags;
 use crate::{trace, CodegenError, CodegenResult};
@@ -587,7 +588,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Generate the return instruction.
-    pub fn gen_return(&mut self, rets: Vec<ValueRegs<Reg>>) {
+    pub fn gen_return(&mut self, rets: &[ValueRegs<Reg>]) {
         let mut out_rets = vec![];
 
         let mut rets = rets.into_iter();
@@ -602,7 +603,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             let regs = if ret.purpose == ArgumentPurpose::StructReturn {
                 self.sret_reg.unwrap()
             } else {
-                rets.next().unwrap()
+                *rets.next().unwrap()
             };
 
             let (regs, insns) = self.vcode.abi().gen_copy_regs_to_retval(
@@ -631,6 +632,88 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
         let inst = self.abi().gen_rets(out_rets);
         self.emit(inst);
+    }
+
+    /// Generate list of registers to hold the output of a call with
+    /// signature `sig`.
+    pub fn gen_call_output(&mut self, sig: &Signature) -> InstOutput {
+        let mut rets = smallvec![];
+        for ty in sig.returns.iter().map(|ret| ret.value_type) {
+            rets.push(self.vregs.alloc_with_deferred_error(ty));
+        }
+        rets
+    }
+
+    /// Likewise, but for a `SigRef` instead.
+    pub fn gen_call_output_from_sig_ref(&mut self, sig_ref: SigRef) -> InstOutput {
+        self.gen_call_output(&self.f.dfg.signatures[sig_ref])
+    }
+
+    /// Set up arguments values `args` for a call with signature `sig`.
+    pub fn gen_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+        let (uses, insts) = self.vcode.abi().gen_call_args(
+            self.vcode.sigs(),
+            sig,
+            args,
+            /* is_tail_call */ false,
+            &self.flags,
+            &mut self.vregs,
+        );
+        for insn in insts {
+            self.emit(insn);
+        }
+        uses
+    }
+
+    /// Likewise, but for a `return_call`.
+    pub fn gen_return_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+        let (uses, insts) = self.vcode.abi().gen_call_args(
+            self.vcode.sigs(),
+            sig,
+            args,
+            /* is_tail_call */ true,
+            &self.flags,
+            &mut self.vregs,
+        );
+        for insn in insts {
+            self.emit(insn);
+        }
+        uses
+    }
+
+    /// Set up return values `outputs` for a call with signature `sig`.
+    pub fn gen_call_rets(&mut self, sig: Sig, outputs: &[ValueRegs<Reg>]) -> CallRetList {
+        self.vcode
+            .abi()
+            .gen_call_rets(self.vcode.sigs(), sig, outputs, None, &mut self.vregs)
+    }
+
+    /// Likewise, but for a `try_call`.
+    pub fn gen_try_call_rets(&mut self, sig: Sig) -> CallRetList {
+        let ir_inst = self.cur_inst.unwrap();
+        let mut outputs: SmallVec<[ValueRegs<Reg>; 2]> = smallvec![];
+        for return_def in self.try_call_rets.get(&ir_inst).unwrap() {
+            outputs.push(return_def.map(|r| r.to_reg()));
+        }
+        let payloads = Some(&self.try_call_payloads.get(&ir_inst).unwrap()[..]);
+
+        self.vcode
+            .abi()
+            .gen_call_rets(self.vcode.sigs(), sig, &outputs, payloads, &mut self.vregs)
+    }
+
+    /// Populate a `CallInfo` for a call with signature `sig`.
+    pub fn gen_call_info<T>(
+        &mut self,
+        sig: Sig,
+        dest: T,
+        uses: CallArgList,
+        defs: CallRetList,
+        try_call_info: Option<TryCallInfo>,
+    ) -> CallInfo<T> {
+        self.vcode
+            .abi()
+            .gen_call_info(self.vcode.sigs(), sig, dest, uses, defs, try_call_info)
     }
 
     /// Has this instruction been sunk to a use-site (i.e., away from its
@@ -709,6 +792,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             if self.f.dfg.insts[inst].opcode().is_branch() {
                 continue;
             }
+
+            // Value defined by "inst" becomes live after it in normal
+            // order, and therefore **before** in reversed order.
+            self.emit_value_label_live_range_start_for_inst(inst);
 
             // Normal instruction: codegen if the instruction is side-effecting
             // or any of its outputs is used.
@@ -801,11 +888,6 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                     }
                 }
             }
-
-            // Emit value-label markers if needed, to later recover
-            // debug mappings. This must happen before the instruction
-            // (so after we emit, in bottom-to-top pass).
-            self.emit_value_label_markers_for_inst(inst);
         }
 
         // Add the block params to this block.
@@ -869,7 +951,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         }
     }
 
-    fn emit_value_label_markers_for_inst(&mut self, inst: Inst) {
+    fn emit_value_label_live_range_start_for_inst(&mut self, inst: Inst) {
         if self.f.dfg.values_labels.is_none() {
             return;
         }
@@ -884,7 +966,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         }
     }
 
-    fn emit_value_label_markers_for_block_args(&mut self, block: Block) {
+    fn emit_value_label_live_range_start_for_block_args(&mut self, block: Block) {
         if self.f.dfg.values_labels.is_none() {
             return;
         }
@@ -1088,7 +1170,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             // Original block body.
             if let Some(bb) = lb.orig_block() {
                 self.lower_clif_block(backend, bb, ctrl_plane)?;
-                self.emit_value_label_markers_for_block_args(bb);
+                self.emit_value_label_live_range_start_for_block_args(bb);
             }
 
             if bindex.index() == 0 {

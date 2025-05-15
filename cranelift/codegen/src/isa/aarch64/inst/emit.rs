@@ -107,13 +107,8 @@ fn machreg_to_gpr_or_vec(m: Reg) -> u32 {
     u32::from(m.to_real_reg().unwrap().hw_enc() & 31)
 }
 
-pub(crate) fn enc_arith_rrr(
-    bits_31_21: u32,
-    bits_15_10: u32,
-    rd: Writable<Reg>,
-    rn: Reg,
-    rm: Reg,
-) -> u32 {
+/// Encode a 3-register aeithmeric instruction.
+pub fn enc_arith_rrr(bits_31_21: u32, bits_15_10: u32, rd: Writable<Reg>, rn: Reg, rm: Reg) -> u32 {
     (bits_31_21 << 21)
         | (bits_15_10 << 10)
         | machreg_to_gpr(rd.to_reg())
@@ -204,7 +199,13 @@ fn enc_test_bit_and_branch(
         | machreg_to_gpr(reg)
 }
 
-fn enc_move_wide(op: MoveWideOp, rd: Writable<Reg>, imm: MoveWideConst, size: OperandSize) -> u32 {
+/// Encode a move-wide instruction.
+pub fn enc_move_wide(
+    op: MoveWideOp,
+    rd: Writable<Reg>,
+    imm: MoveWideConst,
+    size: OperandSize,
+) -> u32 {
     assert!(imm.shift <= 0b11);
     let op = match op {
         MoveWideOp::MovN => 0b00,
@@ -218,7 +219,8 @@ fn enc_move_wide(op: MoveWideOp, rd: Writable<Reg>, imm: MoveWideConst, size: Op
         | machreg_to_gpr(rd.to_reg())
 }
 
-fn enc_movk(rd: Writable<Reg>, imm: MoveWideConst, size: OperandSize) -> u32 {
+/// Encode a move-keep immediate instruction.
+pub fn enc_movk(rd: Writable<Reg>, imm: MoveWideConst, size: OperandSize) -> u32 {
     assert!(imm.shift <= 0b11);
     0x72800000
         | size.sf_bit() << 31
@@ -2942,14 +2944,11 @@ impl MachInstEmit for Inst {
                     let offset = sink.cur_offset();
                     sink.push_user_stack_map(state, offset, s);
                 }
-                sink.add_call_site();
 
-                // Add exception info, if any, at this point (which will
-                // be the return address on stack).
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    for &(tag, label) in &try_call.exception_dests {
-                        sink.add_exception_handler(tag, label);
-                    }
+                    sink.add_call_site(&try_call.exception_dests);
+                } else {
+                    sink.add_call_site(&[]);
                 }
 
                 if info.callee_pop_size > 0 {
@@ -2989,14 +2988,11 @@ impl MachInstEmit for Inst {
                     let offset = sink.cur_offset();
                     sink.push_user_stack_map(state, offset, s);
                 }
-                sink.add_call_site();
 
-                // Add exception info, if any, at this point (which will
-                // be the return address on stack).
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    for &(tag, label) in &try_call.exception_dests {
-                        sink.add_exception_handler(tag, label);
-                    }
+                    sink.add_call_site(&try_call.exception_dests);
+                } else {
+                    sink.add_call_site(&[]);
                 }
 
                 if info.callee_pop_size > 0 {
@@ -3035,7 +3031,7 @@ impl MachInstEmit for Inst {
                 // for the target, but rather a function relocation.
                 sink.add_reloc(Reloc::Arm64Call, &info.dest, 0);
                 sink.put4(enc_jump26(0b000101, 0));
-                sink.add_call_site();
+                sink.add_call_site(&[]);
 
                 // `emit_return_call_common_sequence` emits an island if
                 // necessary, so we can safely disable the worst-case-size check
@@ -3050,7 +3046,7 @@ impl MachInstEmit for Inst {
                     targets: vec![],
                 }
                 .emit(sink, emit_info, state);
-                sink.add_call_site();
+                sink.add_call_site(&[]);
 
                 // `emit_return_call_common_sequence` emits an island if
                 // necessary, so we can safely disable the worst-case-size check

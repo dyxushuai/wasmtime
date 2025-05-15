@@ -12,7 +12,6 @@
         reason = "stripped down in proxy build",
     )
 )]
-#![expect(clippy::allow_attributes, reason = "crate not migrated yet")]
 
 use crate::bindings::wasi::clocks::{monotonic_clock, wall_clock};
 use crate::bindings::wasi::io::poll;
@@ -52,7 +51,7 @@ use crate::descriptors::{Descriptor, Descriptors, StreamType, Streams};
 pub mod bindings {
     #[cfg(feature = "command")]
     wit_bindgen_rust_macro::generate!({
-        path: "../wasi/wit",
+        path: "../wasi/src/p2/wit",
         world: "wasi:cli/command",
         raw_strings,
         runtime_path: "crate::bindings::wit_bindgen_rt_shim",
@@ -62,14 +61,19 @@ pub mod bindings {
         // can't support in these special core-wasm adapters.
         // Instead, we manually define the bindings for these functions in
         // terms of raw pointers.
-        skip: ["run", "get-environment", "poll"],
+        skip: [
+            "run",
+            "get-environment",
+            "poll",
+            "[method]outgoing-datagram-stream.send",
+        ],
         generate_all,
         disable_custom_section_link_helpers: true,
     });
 
     #[cfg(feature = "reactor")]
     wit_bindgen_rust_macro::generate!({
-        path: "../wasi/wit",
+        path: "../wasi/src/p2/wit",
         world: "wasi:cli/imports",
         raw_strings,
         runtime_path: "crate::bindings::wit_bindgen_rt_shim",
@@ -79,7 +83,11 @@ pub mod bindings {
         // can't support in these special core-wasm adapters.
         // Instead, we manually define the bindings for these functions in
         // terms of raw pointers.
-        skip: ["get-environment", "poll"],
+        skip: [
+            "get-environment",
+            "poll",
+            "[method]outgoing-datagram-stream.send",
+        ],
         generate_all,
         disable_custom_section_link_helpers: true,
     });
@@ -102,7 +110,7 @@ pub mod bindings {
         world: "wasmtime:adapter/adapter",
         raw_strings,
         runtime_path: "crate::bindings::wit_bindgen_rt_shim",
-        skip: ["poll"],
+        skip: ["poll", "[method]outgoing-datagram-stream.send"],
         generate_all,
         disable_custom_section_link_helpers: true,
     });

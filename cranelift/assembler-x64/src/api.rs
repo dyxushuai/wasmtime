@@ -111,11 +111,17 @@ pub trait Registers {
     /// An x64 general purpose register that may be read and written.
     type ReadWriteGpr: AsReg;
 
+    /// An x64 general purpose register that may be written.
+    type WriteGpr: AsReg;
+
     /// An x64 SSE register that may be read.
     type ReadXmm: AsReg;
 
     /// An x64 SSE register that may be read and written.
     type ReadWriteXmm: AsReg;
+
+    /// An x64 SSE register that may be written.
+    type WriteXmm: AsReg;
 }
 
 /// Describe how to interact with an external register type.
@@ -156,23 +162,36 @@ impl AsReg for u8 {
 /// re-allocating the entire instruction object.
 pub trait RegisterVisitor<R: Registers> {
     /// Visit a read-only register.
-    fn read(&mut self, reg: &mut R::ReadGpr);
+    fn read_gpr(&mut self, reg: &mut R::ReadGpr);
     /// Visit a read-write register.
-    fn read_write(&mut self, reg: &mut R::ReadWriteGpr);
-    /// Visit a read-only fixed register; for safety, this register cannot be
-    /// modified in-place.
-    fn fixed_read(&mut self, reg: &R::ReadGpr);
-    /// Visit a read-write fixed register; for safety, this register cannot be
-    /// modified in-place.
-    fn fixed_read_write(&mut self, reg: &R::ReadWriteGpr);
+    fn read_write_gpr(&mut self, reg: &mut R::ReadWriteGpr);
+    /// Visit a write-only register.
+    fn write_gpr(&mut self, reg: &mut R::WriteGpr);
+
+    /// Visit a read-only fixed register; this register can be modified in-place
+    /// but must emit as the hardware encoding `enc`.
+    fn fixed_read_gpr(&mut self, reg: &mut R::ReadGpr, enc: u8);
+    /// Visit a read-write fixed register; this register can be modified
+    /// in-place but must emit as the hardware encoding `enc`.
+    fn fixed_read_write_gpr(&mut self, reg: &mut R::ReadWriteGpr, enc: u8);
+    /// Visit a write-only fixed register; this register can be modified
+    /// in-place but must emit as the hardware encoding `enc`.
+    fn fixed_write_gpr(&mut self, reg: &mut R::WriteGpr, enc: u8);
+
     /// Visit a read-only SSE register.
     fn read_xmm(&mut self, reg: &mut R::ReadXmm);
     /// Visit a read-write SSE register.
     fn read_write_xmm(&mut self, reg: &mut R::ReadWriteXmm);
-    /// Visit a read-only fixed SSE register; for safety, this register cannot
-    /// be modified in-place.
-    fn fixed_read_xmm(&mut self, reg: &R::ReadXmm);
-    /// Visit a read-write fixed SSE register; for safety, this register cannot
-    /// be modified in-place.
-    fn fixed_read_write_xmm(&mut self, reg: &R::ReadWriteXmm);
+    /// Visit a write-only SSE register.
+    fn write_xmm(&mut self, reg: &mut R::WriteXmm);
+
+    /// Visit a read-only fixed SSE register; this register can be modified
+    /// in-place but must emit as the hardware encoding `enc`.
+    fn fixed_read_xmm(&mut self, reg: &mut R::ReadXmm, enc: u8);
+    /// Visit a read-write fixed SSE register; this register can be modified
+    /// in-place but must emit as the hardware encoding `enc`.
+    fn fixed_read_write_xmm(&mut self, reg: &mut R::ReadWriteXmm, enc: u8);
+    /// Visit a read-only fixed SSE register; this register can be modified
+    /// in-place but must emit as the hardware encoding `enc`.
+    fn fixed_write_xmm(&mut self, reg: &mut R::WriteXmm, enc: u8);
 }
