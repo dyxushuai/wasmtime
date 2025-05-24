@@ -876,8 +876,8 @@ impl Inst {
                 let x: u32 = 0b0110111 | reg_to_gpr_num(rd.to_reg()) << 7 | (imm.bits() << 12);
                 sink.put4(x);
             }
-            &Inst::Fli { rd, ty, imm } => {
-                sink.put4(encode_fli(ty, imm, rd));
+            &Inst::Fli { rd, width, imm } => {
+                sink.put4(encode_fli(width, imm, rd));
             }
             &Inst::LoadInlineConst { rd, ty, imm } => {
                 let data = &imm.to_le_bytes()[..ty.bytes() as usize];
@@ -984,6 +984,43 @@ impl Inst {
             }
             &Inst::Load {
                 rd,
+                op: LoadOP::Flh,
+                from,
+                flags,
+            } if !emit_info.isa_flags.has_zfhmin() => {
+                // flh unavailable, use an integer load instead
+                Inst::Load {
+                    rd: writable_spilltmp_reg(),
+                    op: LoadOP::Lh,
+                    flags,
+                    from,
+                }
+                .emit(sink, emit_info, state);
+                // NaN-box the `f16` before loading it into the floating-point
+                // register with a 32-bit `fmv`.
+                Inst::Lui {
+                    rd: writable_spilltmp_reg2(),
+                    imm: Imm20::from_i32((0xffff_0000_u32 as i32) >> 12),
+                }
+                .emit(sink, emit_info, state);
+                Inst::AluRRR {
+                    alu_op: AluOPRRR::Or,
+                    rd: writable_spilltmp_reg(),
+                    rs1: spilltmp_reg(),
+                    rs2: spilltmp_reg2(),
+                }
+                .emit(sink, emit_info, state);
+                Inst::FpuRR {
+                    alu_op: FpuOPRR::FmvFmtX,
+                    width: FpuOPWidth::S,
+                    frm: FRM::RNE,
+                    rd,
+                    rs: spilltmp_reg(),
+                }
+                .emit(sink, emit_info, state);
+            }
+            &Inst::Load {
+                rd,
                 op,
                 from,
                 flags,
@@ -1042,6 +1079,29 @@ impl Inst {
                 }
 
                 sink.put4(encode_i_type(op.op_code(), rd, op.funct3(), addr, imm12));
+            }
+            &Inst::Store {
+                op: StoreOP::Fsh,
+                src,
+                flags,
+                to,
+            } if !emit_info.isa_flags.has_zfhmin() => {
+                // fsh unavailable, use an integer store instead
+                Inst::FpuRR {
+                    alu_op: FpuOPRR::FmvXFmt,
+                    width: FpuOPWidth::S,
+                    frm: FRM::RNE,
+                    rd: writable_spilltmp_reg(),
+                    rs: src,
+                }
+                .emit(sink, emit_info, state);
+                Inst::Store {
+                    to,
+                    op: StoreOP::Sh,
+                    flags,
+                    src: spilltmp_reg(),
+                }
+                .emit(sink, emit_info, state);
             }
             &Inst::Store { op, src, flags, to } => {
                 let base = to.get_base_register();
@@ -1123,7 +1183,6 @@ impl Inst {
             }
 
             &Inst::Call { ref info } => {
-                sink.add_call_site();
                 sink.add_reloc(Reloc::RiscvCallPlt, &info.dest, 0);
 
                 Inst::construct_auipc_and_jalr(Some(writable_link_reg()), writable_link_reg(), 0)
@@ -1135,12 +1194,10 @@ impl Inst {
                     sink.push_user_stack_map(state, offset, s);
                 }
 
-                // Add exception info, if any, at this point (which will
-                // be the return address on stack).
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    for &(tag, label) in &try_call.exception_dests {
-                        sink.add_exception_handler(tag, label);
-                    }
+                    sink.add_call_site(&try_call.exception_dests);
+                } else {
+                    sink.add_call_site(&[]);
                 }
 
                 let callee_pop_size = i32::try_from(info.callee_pop_size).unwrap();
@@ -1181,14 +1238,10 @@ impl Inst {
                     sink.push_user_stack_map(state, offset, s);
                 }
 
-                sink.add_call_site();
-
-                // Add exception info, if any, at this point (which will
-                // be the return address on stack).
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    for &(tag, label) in &try_call.exception_dests {
-                        sink.add_exception_handler(tag, label);
-                    }
+                    sink.add_call_site(&try_call.exception_dests);
+                } else {
+                    sink.add_call_site(&[]);
                 }
 
                 let callee_pop_size = i32::try_from(info.callee_pop_size).unwrap();
@@ -1220,7 +1273,7 @@ impl Inst {
             &Inst::ReturnCall { ref info } => {
                 emit_return_call_common_sequence(sink, emit_info, state, info);
 
-                sink.add_call_site();
+                sink.add_call_site(&[]);
                 sink.add_reloc(Reloc::RiscvCallPlt, &info.dest, 0);
                 Inst::construct_auipc_and_jalr(None, writable_spilltmp_reg(), 0)
                     .into_iter()

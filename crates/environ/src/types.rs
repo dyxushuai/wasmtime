@@ -1,4 +1,4 @@
-use crate::{wasm_unsupported, Tunables, WasmResult};
+use crate::{Tunables, WasmResult, wasm_unsupported};
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use core::{fmt, ops::Range};
@@ -1742,6 +1742,8 @@ pub enum ConstOp {
         array_type_index: TypeIndex,
         array_size: u32,
     },
+    ExternConvertAny,
+    AnyConvertExtern,
 }
 
 impl ConstOp {
@@ -1783,6 +1785,8 @@ impl ConstOp {
                 array_type_index: TypeIndex::from_u32(array_type_index),
                 array_size,
             },
+            O::ExternConvertAny => Self::ExternConvertAny,
+            O::AnyConvertExtern => Self::AnyConvertExtern,
             op => {
                 return Err(wasm_unsupported!(
                     "unsupported opcode in const expression at offset {offset:#x}: {op:?}",
@@ -1992,14 +1996,10 @@ impl Memory {
     pub fn static_heap_size(&self) -> Option<u64> {
         let min = self.minimum_byte_size().ok()?;
         let max = self.maximum_byte_size().ok()?;
-        if min == max {
-            Some(min)
-        } else {
-            None
-        }
+        if min == max { Some(min) } else { None }
     }
 
-    /// Returs whether or not the base pointer of this memory is allowed to be
+    /// Returns whether or not the base pointer of this memory is allowed to be
     /// relocated at runtime.
     ///
     /// When this function returns `false` then it means that after the initial
@@ -2016,6 +2016,12 @@ impl Memory {
         // If movement is disallowed in engine configuration, then the answer is
         // "no".
         if !tunables.memory_may_move {
+            return false;
+        }
+
+        // If its minimum and maximum are the same, then the memory will never
+        // be resized, and therefore will never move.
+        if self.limits.max.is_some_and(|max| self.limits.min == max) {
             return false;
         }
 
@@ -2238,7 +2244,7 @@ pub trait TypeConvert {
                 | wasmparser::AbstractHeapType::NoExn
                 | wasmparser::AbstractHeapType::Cont
                 | wasmparser::AbstractHeapType::NoCont => {
-                    return Err(wasm_unsupported!("unsupported heap type {ty:?}"))
+                    return Err(wasm_unsupported!("unsupported heap type {ty:?}"));
                 }
             },
             _ => return Err(wasm_unsupported!("unsupported heap type {ty:?}")),

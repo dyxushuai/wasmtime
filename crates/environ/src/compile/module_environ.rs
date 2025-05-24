@@ -10,7 +10,7 @@ use crate::{
     TableIndex, TableInitialValue, Tag, TagIndex, Tunables, TypeConvert, TypeIndex, Unsigned,
     WasmError, WasmHeapTopType, WasmHeapType, WasmResult, WasmValType, WasmparserTypeConverter,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use cranelift_entity::packed_option::ReservedValue;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -18,9 +18,9 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmparser::{
-    types::Types, CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
+    CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
     FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser, Payload, TypeRef,
-    Validator, ValidatorResources,
+    Validator, ValidatorResources, types::Types,
 };
 
 /// Object containing the standalone environment information.
@@ -525,7 +525,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
             }
 
             Payload::CodeSectionStart { count, range, .. } => {
-                self.validator.code_section_start(count, &range)?;
+                self.validator.code_section_start(&range)?;
                 let cnt = usize::try_from(count).unwrap();
                 self.result.function_body_inputs.reserve_exact(cnt);
                 self.result.debuginfo.wasm_file.code_section_offset = range.start as u64;

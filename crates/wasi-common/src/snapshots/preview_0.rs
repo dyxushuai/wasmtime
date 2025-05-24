@@ -1,7 +1,7 @@
 use crate::file::TableFileExt;
 use crate::sched::{
-    subscription::{RwEventFlags, SubscriptionResult},
     Poll, Userdata,
+    subscription::{RwEventFlags, SubscriptionResult},
 };
 use crate::snapshots::preview_1::types as snapshot1_types;
 use crate::snapshots::preview_1::wasi_snapshot_preview1::WasiSnapshotPreview1 as Snapshot1;
@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use wiggle::{GuestMemory, GuestPtr};
 
 wiggle::from_witx!({
-    witx: ["$CARGO_MANIFEST_DIR/witx/preview0/wasi_unstable.witx"],
+    witx: ["witx/preview0/wasi_unstable.witx"],
     errors: { errno => trappable Error },
     async: *,
     wasmtime: false,

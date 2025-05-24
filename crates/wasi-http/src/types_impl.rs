@@ -1,20 +1,20 @@
 //! Implementation for the `wasi:http/types` interface.
 
 use crate::{
+    WasiHttpImpl, WasiHttpView,
     bindings::http::types::{self, Headers, Method, Scheme, StatusCode, Trailers},
     body::{HostFutureTrailers, HostIncomingBody, HostOutgoingBody, StreamContext},
     types::{
-        is_forbidden_header, remove_forbidden_headers, FieldMap, HostFields,
-        HostFutureIncomingResponse, HostIncomingRequest, HostIncomingResponse, HostOutgoingRequest,
-        HostOutgoingResponse, HostResponseOutparam,
+        FieldMap, HostFields, HostFutureIncomingResponse, HostIncomingRequest,
+        HostIncomingResponse, HostOutgoingRequest, HostOutgoingResponse, HostResponseOutparam,
+        is_forbidden_header, remove_forbidden_headers,
     },
-    WasiHttpImpl, WasiHttpView,
 };
 use anyhow::Context;
 use std::any::Any;
 use std::str::FromStr;
 use wasmtime::component::{Resource, ResourceTable, ResourceTableError};
-use wasmtime_wasi::{DynInputStream, DynOutputStream, DynPollable, IoView};
+use wasmtime_wasi::p2::{DynInputStream, DynOutputStream, DynPollable, IoView};
 
 impl<T> crate::bindings::http::types::Host for WasiHttpImpl<T>
 where
@@ -660,7 +660,7 @@ where
         &mut self,
         index: Resource<HostFutureTrailers>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::subscribe(self.table(), index)
+        wasmtime_wasi::p2::subscribe(self.table(), index)
     }
 
     fn get(
@@ -881,7 +881,7 @@ where
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        wasmtime_wasi::subscribe(self.table(), id)
+        wasmtime_wasi::p2::subscribe(self.table(), id)
     }
 }
 
