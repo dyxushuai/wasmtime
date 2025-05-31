@@ -372,6 +372,9 @@ wasmtime_option_group! {
         /// Component model support for async lifting/lowering: this corresponds
         /// to the 🚟 emoji in the component model specification.
         pub component_model_async_stackful: Option<bool>,
+        /// Component model support for `error-context`: this corresponds
+        /// to the 📝 emoji in the component model specification.
+        pub component_model_error_context: Option<bool>,
         /// Configure support for the function-references proposal.
         pub function_references: Option<bool>,
         /// Configure support for the GC proposal.
@@ -421,9 +424,11 @@ wasmtime_option_group! {
         /// Enable support for WASI key-value imports (experimental)
         pub keyvalue: Option<bool>,
         /// Inherit environment variables and file descriptors following the
-        /// systemd listen fd specification (UNIX only)
+        /// systemd listen fd specification (UNIX only) (legacy wasip1
+        /// implementation only)
         pub listenfd: Option<bool>,
-        /// Grant access to the given TCP listen socket
+        /// Grant access to the given TCP listen socket (experimental, legacy
+        /// wasip1 implementation only)
         #[serde(default)]
         pub tcplisten: Vec<String>,
         /// Enable support for WASI TLS (Transport Layer Security) imports (experimental)
@@ -733,14 +738,12 @@ impl CommonOptions {
 
         #[cfg(feature = "cache")]
         if self.codegen.cache != Some(false) {
-            match &self.codegen.cache_config {
-                Some(path) => {
-                    config.cache_config_load(path)?;
-                }
-                None => {
-                    config.cache_config_load_default()?;
-                }
-            }
+            use wasmtime::Cache;
+            let cache = match &self.codegen.cache_config {
+                Some(path) => Cache::from_file(Some(Path::new(path)))?,
+                None => Cache::from_file(None)?,
+            };
+            config.cache(Some(cache));
         }
         #[cfg(not(feature = "cache"))]
         if self.codegen.cache == Some(true) {
@@ -1015,6 +1018,7 @@ impl CommonOptions {
             ("component-model-async", component_model_async, wasm_component_model_async)
             ("component-model-async", component_model_async_builtins, wasm_component_model_async_builtins)
             ("component-model-async", component_model_async_stackful, wasm_component_model_async_stackful)
+            ("component-model", component_model_error_context, wasm_component_model_error_context)
             ("threads", threads, wasm_threads)
             ("gc", gc, wasm_gc)
             ("gc", reference_types, wasm_reference_types)

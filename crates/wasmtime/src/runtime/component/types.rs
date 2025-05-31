@@ -5,13 +5,13 @@ use crate::{Engine, ExternType, FuncType};
 use alloc::sync::Arc;
 use core::fmt;
 use core::ops::Deref;
-use wasmtime_environ::component::{
-    ComponentTypes, InterfaceType, ResourceIndex, TypeComponentIndex, TypeComponentInstanceIndex,
-    TypeDef, TypeEnumIndex, TypeFlagsIndex, TypeFuncIndex, TypeListIndex, TypeModuleIndex,
-    TypeOptionIndex, TypeRecordIndex, TypeResourceTableIndex, TypeResultIndex, TypeTupleIndex,
-    TypeVariantIndex,
-};
 use wasmtime_environ::PrimaryMap;
+use wasmtime_environ::component::{
+    ComponentTypes, Export, InterfaceType, ResourceIndex, TypeComponentIndex,
+    TypeComponentInstanceIndex, TypeDef, TypeEnumIndex, TypeFlagsIndex, TypeFuncIndex,
+    TypeListIndex, TypeModuleIndex, TypeOptionIndex, TypeRecordIndex, TypeResourceTableIndex,
+    TypeResultIndex, TypeTupleIndex, TypeVariantIndex,
+};
 
 pub use crate::component::resources::ResourceType;
 
@@ -725,6 +725,18 @@ impl ComponentFunc {
             .iter()
             .map(|ty| Type::from(ty, &self.0.instance()))
     }
+
+    #[doc(hidden)]
+    pub fn typecheck<Params, Return>(&self, cx: &InstanceType) -> anyhow::Result<()>
+    where
+        Params: crate::component::ComponentNamedList + crate::component::Lower,
+        Return: crate::component::ComponentNamedList + crate::component::Lift,
+    {
+        let ty = &self.0.types[self.0.index];
+        Params::typecheck(&InterfaceType::Tuple(ty.params), cx)?;
+        Return::typecheck(&InterfaceType::Tuple(ty.results), cx)?;
+        Ok(())
+    }
 }
 
 /// Core module type
@@ -816,6 +828,14 @@ impl Component {
             )
         })
     }
+
+    #[doc(hidden)]
+    pub fn instance_type(&self) -> InstanceType<'_> {
+        InstanceType {
+            types: &self.0.types,
+            resources: &self.0.resources,
+        }
+    }
 }
 
 /// Component instance type
@@ -899,6 +919,20 @@ impl ComponentItem {
                 };
                 Self::Resource(ty)
             }
+        }
+    }
+    pub(crate) fn from_export(engine: &Engine, export: &Export, ty: &InstanceType<'_>) -> Self {
+        match export {
+            Export::Instance { ty: idx, .. } => {
+                Self::ComponentInstance(ComponentInstance::from(*idx, ty))
+            }
+            Export::LiftedFunction { ty: idx, .. } => {
+                Self::ComponentFunc(ComponentFunc::from(*idx, ty))
+            }
+            Export::ModuleStatic { ty: idx, .. } | Export::ModuleImport { ty: idx, .. } => {
+                Self::Module(Module::from(*idx, ty))
+            }
+            Export::Type(idx) => Self::from(engine, idx, ty),
         }
     }
 }

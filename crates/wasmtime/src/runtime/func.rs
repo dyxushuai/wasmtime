@@ -1,9 +1,9 @@
 use crate::prelude::*;
+use crate::runtime::Uninhabited;
 use crate::runtime::vm::{
     ExportFunction, InterpreterRef, SendSyncPtr, StoreBox, VMArrayCallHostFuncContext, VMContext,
-    VMFuncRef, VMFunctionImport, VMOpaqueContext,
+    VMFuncRef, VMFunctionImport, VMOpaqueContext, VMStoreContext,
 };
-use crate::runtime::Uninhabited;
 use crate::store::{AutoAssertNoGc, StoreData, StoreOpaque, Stored};
 use crate::type_registry::RegisteredType;
 use crate::{
@@ -412,7 +412,7 @@ impl Func {
     ///
     /// Panics if the given function type is not associated with this store's
     /// engine.
-    pub fn new<T>(
+    pub fn new<T: 'static>(
         store: impl AsContextMut<Data = T>,
         ty: FuncType,
         func: impl Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static,
@@ -454,7 +454,7 @@ impl Func {
     ///
     /// Panics if the given function type is not associated with this store's
     /// engine.
-    pub unsafe fn new_unchecked<T>(
+    pub unsafe fn new_unchecked<T: 'static>(
         mut store: impl AsContextMut<Data = T>,
         ty: FuncType,
         func: impl Fn(Caller<'_, T>, &mut [ValRaw]) -> Result<()> + Send + Sync + 'static,
@@ -548,6 +548,7 @@ impl Func {
             + Send
             + Sync
             + 'static,
+        T: 'static,
     {
         assert!(
             store.as_context().async_support(),
@@ -826,7 +827,10 @@ impl Func {
     pub fn wrap<T, Params, Results>(
         mut store: impl AsContextMut<Data = T>,
         func: impl IntoFunc<T, Params, Results>,
-    ) -> Func {
+    ) -> Func
+    where
+        T: 'static,
+    {
         let store = store.as_context_mut().0;
         // part of this unsafety is about matching the `T` to a `Store<T>`,
         // which is done through the `AsContextMut` bound above.
@@ -842,6 +846,7 @@ impl Func {
         F: Fn(Caller<'_, T>, Params) -> Results + Send + Sync + 'static,
         Params: WasmTyList,
         Results: WasmRet,
+        T: 'static,
     {
         let store = store.as_context_mut().0;
         // part of this unsafety is about matching the `T` to a `Store<T>`,
@@ -868,6 +873,7 @@ impl Func {
             + 'static,
         P: WasmTyList,
         R: WasmRet,
+        T: 'static,
     {
         assert!(
             store.as_context().async_support(),
@@ -943,6 +949,7 @@ impl Func {
     /// `StoreOpaque` while the `FuncType` is also being used (from the
     /// perspective of the borrow-checker) because otherwise the signature would
     /// consider `StoreOpaque` borrowed mutable while `FuncType` is in use.
+    #[inline]
     fn ty_ref<'a>(&self, store: &'a mut StoreOpaque) -> (&'a FuncType, &'a StoreOpaque) {
         // If we haven't loaded our type into the store yet then do so lazily at
         // this time.
@@ -1140,15 +1147,12 @@ impl Func {
     /// only works with functions defined within an asynchronous store. Also
     /// panics if `store` does not own this function.
     #[cfg(feature = "async")]
-    pub async fn call_async<T>(
+    pub async fn call_async(
         &self,
-        mut store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data: Send>,
         params: &[Val],
         results: &mut [Val],
-    ) -> Result<()>
-    where
-        T: Send,
-    {
+    ) -> Result<()> {
         let mut store = store.as_context_mut();
         assert!(
             store.0.async_support(),
@@ -1327,7 +1331,7 @@ impl Func {
             };
             VMFunctionImport {
                 wasm_call: if let Some(wasm_call) = f.as_ref().wasm_call {
-                    wasm_call.into()
+                    wasm_call
                 } else {
                     // Assert that this is a array-call function, since those
                     // are the only ones that could be missing a `wasm_call`
@@ -1335,10 +1339,13 @@ impl Func {
                     let _ = VMArrayCallHostFuncContext::from_opaque(f.as_ref().vmctx.as_non_null());
 
                     let sig = self.type_index(store.store_data());
-                    module.wasm_to_array_trampoline(sig).expect(
-                        "if the wasm is importing a function of a given type, it must have the \
+                    module
+                        .wasm_to_array_trampoline(sig)
+                        .expect(
+                            "if the wasm is importing a function of a given type, it must have the \
                          type's trampoline",
-                    ).into()
+                        )
+                        .into()
                 },
                 array_call: f.as_ref().array_call,
                 vmctx: f.as_ref().vmctx,
@@ -1604,103 +1611,157 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
     closure: impl FnMut(NonNull<VMContext>, Option<InterpreterRef<'_>>) -> bool,
 ) -> Result<()> {
     unsafe {
-        let exit = enter_wasm(store);
+        let previous_runtime_state = EntryStoreContext::enter_wasm(store);
 
         if let Err(trap) = store.0.call_hook(CallHook::CallingWasm) {
-            exit_wasm(store, exit);
+            // `previous_runtime_state` implicitly dropped here
             return Err(trap);
         }
-        let result = crate::runtime::vm::catch_traps(store, closure);
-        exit_wasm(store, exit);
+        let result = crate::runtime::vm::catch_traps(store, &previous_runtime_state, closure);
+        core::mem::drop(previous_runtime_state);
         store.0.call_hook(CallHook::ReturningFromWasm)?;
         result.map_err(|t| crate::trap::from_runtime_box(store.0, t))
     }
 }
 
-/// This function is called to register state within `Store` whenever
-/// WebAssembly is entered within the `Store`.
-///
-/// This function sets up various limits such as:
-///
-/// * The stack limit. This is what ensures that we limit the stack space
-///   allocated by WebAssembly code and it's relative to the initial stack
-///   pointer that called into wasm.
-///
-/// This function may fail if the stack limit can't be set because an
-/// interrupt already happened.
-fn enter_wasm<T>(store: &mut StoreContextMut<'_, T>) -> Option<usize> {
-    // If this is a recursive call, e.g. our stack limit is already set, then
-    // we may be able to skip this function.
-    //
-    // For synchronous stores there's nothing else to do because all wasm calls
-    // happen synchronously and on the same stack. This means that the previous
-    // stack limit will suffice for the next recursive call.
-    //
-    // For asynchronous stores then each call happens on a separate native
-    // stack. This means that the previous stack limit is no longer relevant
-    // because we're on a separate stack.
-    if unsafe { *store.0.vm_store_context().stack_limit.get() } != usize::MAX
-        && !store.0.async_support()
-    {
-        return None;
-    }
+/// This type helps managing the state of the runtime when entering and exiting
+/// Wasm. To this end, it contains a subset of the data in `VMStoreContext`.
+/// Upon entering Wasm, it updates various runtime fields and their
+/// original values saved in this struct. Upon exiting Wasm, the previous values
+/// are restored.
+pub(crate) struct EntryStoreContext {
+    /// If set, contains value of `stack_limit` field to restore in
+    /// `VMRuntimeLimits` when exiting Wasm.
+    pub stack_limit: Option<usize>,
+    /// Contains value of `last_wasm_exit_pc` field to restore in
+    /// `VMStoreContext` when exiting Wasm.
+    pub last_wasm_exit_pc: usize,
+    /// Contains value of `last_wasm_exit_fp` field to restore in
+    /// `VMStoreContext` when exiting Wasm.
+    pub last_wasm_exit_fp: usize,
+    /// Contains value of `last_wasm_entry_fp` field to restore in
+    /// `VMStoreContext` when exiting Wasm.
+    pub last_wasm_entry_fp: usize,
 
-    // Ignore this stack pointer business on miri since we can't execute wasm
-    // anyway and the concept of a stack pointer on miri is a bit nebulous
-    // regardless.
-    if cfg!(miri) {
-        return None;
-    }
-
-    // When Cranelift has support for the host then we might be running native
-    // compiled code meaning we need to read the actual stack pointer. If
-    // Cranelift can't be used though then we're guaranteed to be running pulley
-    // in which case this stack pointer isn't actually used as Pulley has custom
-    // mechanisms for stack overflow.
-    #[cfg(has_host_compiler_backend)]
-    let stack_pointer = crate::runtime::vm::get_stack_pointer();
-    #[cfg(not(has_host_compiler_backend))]
-    let stack_pointer = {
-        use wasmtime_environ::TripleExt;
-        debug_assert!(store.engine().target().is_pulley());
-        usize::MAX
-    };
-
-    // Determine the stack pointer where, after which, any wasm code will
-    // immediately trap. This is checked on the entry to all wasm functions.
-    //
-    // Note that this isn't 100% precise. We are requested to give wasm
-    // `max_wasm_stack` bytes, but what we're actually doing is giving wasm
-    // probably a little less than `max_wasm_stack` because we're
-    // calculating the limit relative to this function's approximate stack
-    // pointer. Wasm will be executed on a frame beneath this one (or next
-    // to it). In any case it's expected to be at most a few hundred bytes
-    // of slop one way or another. When wasm is typically given a MB or so
-    // (a million bytes) the slop shouldn't matter too much.
-    //
-    // After we've got the stack limit then we store it into the `stack_limit`
-    // variable.
-    let wasm_stack_limit = stack_pointer - store.engine().config().max_wasm_stack;
-    let prev_stack = unsafe {
-        mem::replace(
-            &mut *store.0.vm_store_context().stack_limit.get(),
-            wasm_stack_limit,
-        )
-    };
-
-    Some(prev_stack)
+    /// We need a pointer to the runtime limits, so we can update them from
+    /// `drop`/`exit_wasm`.
+    vm_store_context: *const VMStoreContext,
 }
 
-fn exit_wasm<T>(store: &mut StoreContextMut<'_, T>, prev_stack: Option<usize>) {
-    // If we don't have a previous stack pointer to restore, then there's no
-    // cleanup we need to perform here.
-    let prev_stack = match prev_stack {
-        Some(stack) => stack,
-        None => return,
-    };
+impl EntryStoreContext {
+    /// This function is called to update and save state when
+    /// WebAssembly is entered within the `Store`.
+    ///
+    /// This updates various fields such as:
+    ///
+    /// * The stack limit. This is what ensures that we limit the stack space
+    ///   allocated by WebAssembly code and it's relative to the initial stack
+    ///   pointer that called into wasm.
+    ///
+    /// It also saves the different last_wasm_* values in the `VMRuntimeLimits`.
+    pub fn enter_wasm<T>(store: &mut StoreContextMut<'_, T>) -> Self {
+        let stack_limit;
 
-    unsafe {
-        *store.0.vm_store_context().stack_limit.get() = prev_stack;
+        // If this is a recursive call, e.g. our stack limit is already set, then
+        // we may be able to skip this function.
+        //
+        // For synchronous stores there's nothing else to do because all wasm calls
+        // happen synchronously and on the same stack. This means that the previous
+        // stack limit will suffice for the next recursive call.
+        //
+        // For asynchronous stores then each call happens on a separate native
+        // stack. This means that the previous stack limit is no longer relevant
+        // because we're on a separate stack.
+        if unsafe { *store.0.vm_store_context().stack_limit.get() } != usize::MAX
+            && !store.0.async_support()
+        {
+            stack_limit = None;
+        }
+        // Ignore this stack pointer business on miri since we can't execute wasm
+        // anyway and the concept of a stack pointer on miri is a bit nebulous
+        // regardless.
+        else if cfg!(miri) {
+            stack_limit = None;
+        } else {
+            // When Cranelift has support for the host then we might be running native
+            // compiled code meaning we need to read the actual stack pointer. If
+            // Cranelift can't be used though then we're guaranteed to be running pulley
+            // in which case this stack pointer isn't actually used as Pulley has custom
+            // mechanisms for stack overflow.
+            #[cfg(has_host_compiler_backend)]
+            let stack_pointer = crate::runtime::vm::get_stack_pointer();
+            #[cfg(not(has_host_compiler_backend))]
+            let stack_pointer = {
+                use wasmtime_environ::TripleExt;
+                debug_assert!(store.engine().target().is_pulley());
+                usize::MAX
+            };
+
+            // Determine the stack pointer where, after which, any wasm code will
+            // immediately trap. This is checked on the entry to all wasm functions.
+            //
+            // Note that this isn't 100% precise. We are requested to give wasm
+            // `max_wasm_stack` bytes, but what we're actually doing is giving wasm
+            // probably a little less than `max_wasm_stack` because we're
+            // calculating the limit relative to this function's approximate stack
+            // pointer. Wasm will be executed on a frame beneath this one (or next
+            // to it). In any case it's expected to be at most a few hundred bytes
+            // of slop one way or another. When wasm is typically given a MB or so
+            // (a million bytes) the slop shouldn't matter too much.
+            //
+            // After we've got the stack limit then we store it into the `stack_limit`
+            // variable.
+            let wasm_stack_limit = stack_pointer
+                .checked_sub(store.engine().config().max_wasm_stack)
+                .unwrap();
+            let prev_stack = unsafe {
+                mem::replace(
+                    &mut *store.0.vm_store_context().stack_limit.get(),
+                    wasm_stack_limit,
+                )
+            };
+            stack_limit = Some(prev_stack);
+        }
+
+        unsafe {
+            let last_wasm_exit_pc = *store.0.vm_store_context().last_wasm_exit_pc.get();
+            let last_wasm_exit_fp = *store.0.vm_store_context().last_wasm_exit_fp.get();
+            let last_wasm_entry_fp = *store.0.vm_store_context().last_wasm_entry_fp.get();
+
+            let vm_store_context = store.0.vm_store_context();
+
+            Self {
+                stack_limit,
+                last_wasm_exit_pc,
+                last_wasm_exit_fp,
+                last_wasm_entry_fp,
+                vm_store_context,
+            }
+        }
+    }
+
+    /// This function restores the values stored in this struct. We invoke this
+    /// function through this type's `Drop` implementation. This ensures that we
+    /// even restore the values if we unwind the stack (e.g., because we are
+    /// panicing out of a Wasm execution).
+    #[inline]
+    fn exit_wasm(&mut self) {
+        unsafe {
+            if let Some(limit) = self.stack_limit {
+                *(&*self.vm_store_context).stack_limit.get() = limit;
+            }
+
+            *(*self.vm_store_context).last_wasm_exit_fp.get() = self.last_wasm_exit_fp;
+            *(*self.vm_store_context).last_wasm_exit_pc.get() = self.last_wasm_exit_pc;
+            *(*self.vm_store_context).last_wasm_entry_fp.get() = self.last_wasm_entry_fp;
+        }
+    }
+}
+
+impl Drop for EntryStoreContext {
+    #[inline]
+    fn drop(&mut self) {
+        self.exit_wasm();
     }
 }
 
@@ -1907,6 +1968,7 @@ macro_rules! impl_into_func {
             F: Fn($arg) -> R + Send + Sync + 'static,
             $arg: WasmTy,
             R: WasmRet,
+            T: 'static,
         {
             fn into_func(self, engine: &Engine) -> HostContext {
                 let f = move |_: Caller<'_, T>, $arg: $arg| {
@@ -1923,6 +1985,7 @@ macro_rules! impl_into_func {
             F: Fn(Caller<'_, T>, $arg) -> R + Send + Sync + 'static,
             $arg: WasmTy,
             R: WasmRet,
+            T: 'static,
         {
             fn into_func(self, engine: &Engine) -> HostContext {
                 HostContext::from_closure(engine, move |caller: Caller<'_, T>, ($arg,)| {
@@ -1941,6 +2004,7 @@ macro_rules! impl_into_func {
             F: Fn($($args),*) -> R + Send + Sync + 'static,
             $($args: WasmTy,)*
             R: WasmRet,
+            T: 'static,
         {
             fn into_func(self, engine: &Engine) -> HostContext {
                 let f = move |_: Caller<'_, T>, $($args:$args),*| {
@@ -1957,6 +2021,7 @@ macro_rules! impl_into_func {
             F: Fn(Caller<'_, T>, $($args),*) -> R + Send + Sync + 'static,
             $($args: WasmTy,)*
             R: WasmRet,
+            T: 'static,
         {
             fn into_func(self, engine: &Engine) -> HostContext {
                 HostContext::from_closure(engine, move |caller: Caller<'_, T>, ( $( $args ),* )| {
@@ -2039,7 +2104,7 @@ for_each_function_signature!(impl_wasm_ty_list);
 ///
 /// Host functions which want access to [`Store`](crate::Store)-level state are
 /// recommended to use this type.
-pub struct Caller<'a, T> {
+pub struct Caller<'a, T: 'static> {
     pub(crate) store: StoreContextMut<'a, T>,
     caller: &'a crate::runtime::vm::Instance,
 }
@@ -2222,7 +2287,7 @@ impl<T> Caller<'_, T> {
     #[cfg(all(feature = "async", feature = "gc"))]
     pub async fn gc_async(&mut self, why: Option<&crate::GcHeapOutOfMemory<()>>) -> Result<()>
     where
-        T: Send,
+        T: Send + 'static,
     {
         self.store.gc_async(why).await
     }
@@ -2250,14 +2315,14 @@ impl<T> Caller<'_, T> {
     }
 }
 
-impl<T> AsContext for Caller<'_, T> {
+impl<T: 'static> AsContext for Caller<'_, T> {
     type Data = T;
     fn as_context(&self) -> StoreContext<'_, T> {
         self.store.as_context()
     }
 }
 
-impl<T> AsContextMut for Caller<'_, T> {
+impl<T: 'static> AsContextMut for Caller<'_, T> {
     fn as_context_mut(&mut self) -> StoreContextMut<'_, T> {
         self.store.as_context_mut()
     }
@@ -2291,6 +2356,7 @@ impl HostContext {
         F: Fn(Caller<'_, T>, P) -> R + Send + Sync + 'static,
         P: WasmTyList,
         R: WasmRet,
+        T: 'static,
     {
         let ty = R::func_type(engine, None::<ValType>.into_iter().chain(P::valtypes()));
         let type_index = ty.type_index();
@@ -2321,6 +2387,7 @@ impl HostContext {
         F: Fn(Caller<'_, T>, P) -> R + 'static,
         P: WasmTyList,
         R: WasmRet,
+        T: 'static,
     {
         // Note that this function is intentionally scoped into a
         // separate closure. Handling traps and panics will involve
@@ -2419,7 +2486,10 @@ impl HostFunc {
         engine: &Engine,
         ty: FuncType,
         func: impl Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static,
-    ) -> Self {
+    ) -> Self
+    where
+        T: 'static,
+    {
         assert!(ty.comes_from_same_engine(engine));
         let ty_clone = ty.clone();
         unsafe {
@@ -2439,7 +2509,10 @@ impl HostFunc {
         engine: &Engine,
         ty: FuncType,
         func: impl Fn(Caller<'_, T>, &mut [ValRaw]) -> Result<()> + Send + Sync + 'static,
-    ) -> Self {
+    ) -> Self
+    where
+        T: 'static,
+    {
         assert!(ty.comes_from_same_engine(engine));
         let func = move |caller_vmctx, values: &mut [ValRaw]| {
             Caller::<T>::with(caller_vmctx, |mut caller| {
@@ -2461,6 +2534,7 @@ impl HostFunc {
         F: Fn(Caller<'_, T>, Params) -> Results + Send + Sync + 'static,
         Params: WasmTyList,
         Results: WasmRet,
+        T: 'static,
     {
         let ctx = HostContext::from_closure(engine, func);
         HostFunc::_new(engine, ctx)
@@ -2470,7 +2544,10 @@ impl HostFunc {
     pub fn wrap<T, Params, Results>(
         engine: &Engine,
         func: impl IntoFunc<T, Params, Results>,
-    ) -> Self {
+    ) -> Self
+    where
+        T: 'static,
+    {
         let ctx = func.into_func(engine);
         HostFunc::_new(engine, ctx)
     }

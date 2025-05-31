@@ -1,10 +1,10 @@
 use crate::linker::{Definition, DefinitionType};
 use crate::prelude::*;
 use crate::runtime::vm::{
-    Imports, InstanceAllocationRequest, ModuleRuntimeInfo, StorePtr, VMFuncRef, VMFunctionImport,
-    VMGlobalImport, VMMemoryImport, VMOpaqueContext, VMTable, VMTagImport,
+    Imports, ModuleRuntimeInfo, VMFuncRef, VMFunctionImport, VMGlobalImport, VMMemoryImport,
+    VMOpaqueContext, VMTable, VMTagImport,
 };
-use crate::store::{InstanceId, StoreOpaque, Stored};
+use crate::store::{AllocateInstanceKind, InstanceId, StoreOpaque, Stored};
 use crate::types::matching;
 use crate::{
     AsContextMut, Engine, Export, Extern, Func, Global, Memory, Module, ModuleExport, SharedMemory,
@@ -145,14 +145,11 @@ impl Instance {
     /// This function will also panic, like [`Instance::new`], if any [`Extern`]
     /// specified does not belong to `store`.
     #[cfg(feature = "async")]
-    pub async fn new_async<T>(
-        mut store: impl AsContextMut<Data = T>,
+    pub async fn new_async(
+        mut store: impl AsContextMut<Data: Send>,
         module: &Module,
         imports: &[Extern],
-    ) -> Result<Instance>
-    where
-        T: Send,
-    {
+    ) -> Result<Instance> {
         let mut store = store.as_context_mut();
         let imports = Instance::typecheck_externs(store.0, module, imports)?;
         // See `new` for notes on this unsafety
@@ -221,7 +218,7 @@ impl Instance {
         imports: Imports<'_>,
     ) -> Result<Instance>
     where
-        T: Send,
+        T: Send + 'static,
     {
         assert!(
             store.0.async_support(),
@@ -281,33 +278,12 @@ impl Instance {
         // it's the same later when we do actually insert it.
         let instance_to_be = store.store_data().next_id::<InstanceData>();
 
-        let mut instance_handle =
-            store
-                .engine()
-                .allocator()
-                .allocate_module(InstanceAllocationRequest {
-                    runtime_info: &ModuleRuntimeInfo::Module(module.clone()),
-                    imports,
-                    host_state: Box::new(Instance(instance_to_be)),
-                    store: StorePtr::new(store.traitobj()),
-                    wmemcheck: store.engine().config().wmemcheck,
-                    pkey: store.get_pkey(),
-                    tunables: store.engine().tunables(),
-                })?;
-
-        // The instance still has lots of setup, for example
-        // data/elements/start/etc. This can all fail, but even on failure
-        // the instance may persist some state via previous successful
-        // initialization. For this reason once we have an instance handle
-        // we immediately insert it into the store to keep it alive.
-        //
-        // Note that we `clone` the instance handle just to make easier
-        // working the borrow checker here easier. Technically the `&mut
-        // instance` has somewhat of a borrow on `store` (which
-        // conflicts with the borrow on `store.engine`) but this doesn't
-        // matter in practice since initialization isn't even running any
-        // code here anyway.
-        let id = store.add_instance(instance_handle.clone(), module_id);
+        let id = store.allocate_instance(
+            AllocateInstanceKind::Module(module_id),
+            &ModuleRuntimeInfo::Module(module.clone()),
+            imports,
+            Box::new(Instance(instance_to_be)),
+        )?;
 
         // Additionally, before we start doing fallible instantiation, we
         // do one more step which is to insert an `InstanceData`
@@ -345,7 +321,10 @@ impl Instance {
             .engine()
             .features()
             .contains(WasmFeatures::BULK_MEMORY);
-        instance_handle.initialize(store, compiled_module.module(), bulk_memory)?;
+        store
+            .instance(id)
+            .clone()
+            .initialize(store, compiled_module.module(), bulk_memory)?;
 
         Ok((instance, compiled_module.module().start_func))
     }
@@ -374,7 +353,7 @@ impl Instance {
     }
 
     /// Get this instance's module.
-    pub fn module<'a, T: 'a>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a Module {
+    pub fn module<'a, T: 'static>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a Module {
         self._module(store.into().0)
     }
 
@@ -388,7 +367,7 @@ impl Instance {
     /// # Panics
     ///
     /// Panics if `store` does not own this instance.
-    pub fn exports<'a, T: 'a>(
+    pub fn exports<'a, T: 'static>(
         &'a self,
         store: impl Into<StoreContextMut<'a, T>>,
     ) -> impl ExactSizeIterator<Item = Export<'a>> + 'a {
@@ -824,7 +803,7 @@ impl<T> Clone for InstancePre<T> {
     }
 }
 
-impl<T> InstancePre<T> {
+impl<T: 'static> InstancePre<T> {
     /// Creates a new `InstancePre` which type-checks the `items` provided and
     /// on success is ready to instantiate a new instance.
     ///
@@ -917,11 +896,8 @@ impl<T> InstancePre<T> {
     #[cfg(feature = "async")]
     pub async fn instantiate_async(
         &self,
-        mut store: impl AsContextMut<Data = T>,
-    ) -> Result<Instance>
-    where
-        T: Send,
-    {
+        mut store: impl AsContextMut<Data: Send>,
+    ) -> Result<Instance> {
         let mut store = store.as_context_mut();
         let imports = pre_instantiate_raw(
             &mut store.0,

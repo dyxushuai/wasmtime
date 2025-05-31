@@ -85,6 +85,9 @@ audit-as-crates-io = true
 [policy.cranelift-serde]
 audit-as-crates-io = true
 
+[policy.cranelift-srcgen]
+audit-as-crates-io = true
+
 [policy.isle-fuzz]
 criteria = []
 
@@ -179,6 +182,9 @@ audit-as-crates-io = true
 audit-as-crates-io = true
 
 [policy.wasmtime-wasi-threads]
+audit-as-crates-io = true
+
+[policy.wasmtime-wasi-tls]
 audit-as-crates-io = true
 
 [policy.wasmtime-wast]
@@ -310,10 +316,6 @@ criteria = "safe-to-deploy"
 version = "0.2.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.gimli]]
-version = "0.26.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.h2]]
 version = "0.4.4"
 criteria = "safe-to-deploy"
@@ -393,7 +395,7 @@ version = "0.2.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.mio]]
-version = "0.8.11"
+version = "1.0.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.ndarray]]
@@ -485,7 +487,7 @@ version = "2.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ring]]
-version = "0.17.3"
+version = "0.17.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
@@ -549,12 +551,12 @@ version = "0.3.36"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
-version = "1.30.0"
+version = "1.44.2"
 criteria = "safe-to-deploy"
 notes = "we are exempting tokio, hyper, and their tightly coupled dependencies by the same authors, expecting that the authors at aws will publish attestions we can import at some point soon"
 
 [[exemptions.tokio-macros]]
-version = "1.7.0"
+version = "2.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-rustls]]

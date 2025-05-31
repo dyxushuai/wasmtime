@@ -1,13 +1,13 @@
+use crate::ScopeVec;
 use crate::component::*;
 use crate::prelude::*;
-use crate::ScopeVec;
 use crate::{
     EngineOrModuleTypeIndex, EntityIndex, ModuleEnvironment, ModuleInternedTypeIndex,
     ModuleTranslation, ModuleTypesBuilder, PrimaryMap, TagIndex, Tunables, TypeConvert,
     WasmHeapType, WasmResult, WasmValType,
 };
 use anyhow::anyhow;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::mem;
@@ -812,6 +812,8 @@ impl<'a, 'data> Translator<'a, 'data> {
                         }
                         wasmparser::CanonicalFunction::ContextGet(..)
                         | wasmparser::CanonicalFunction::ContextSet(..)
+                        | wasmparser::CanonicalFunction::TaskCancel
+                        | wasmparser::CanonicalFunction::SubtaskCancel { .. }
                         | wasmparser::CanonicalFunction::ThreadSpawnRef { .. }
                         | wasmparser::CanonicalFunction::ThreadSpawnIndirect { .. }
                         | wasmparser::CanonicalFunction::ThreadAvailableParallelism => {
@@ -1217,6 +1219,7 @@ impl<'a, 'data> Translator<'a, 'data> {
                     let idx = FuncIndex::from_u32(*idx);
                     ret.callback = Some(idx);
                 }
+                wasmparser::CanonicalOption::CoreType(_) => todo!(),
             }
         }
         return ret;

@@ -1,14 +1,15 @@
 use crate::{
-    abi::{scratch, vmctx, ABIOperand, ABISig, RetArea},
+    abi::{ABIOperand, ABISig, RetArea, scratch, vmctx},
     codegen::BlockSig,
-    isa::reg::{writable, Reg},
+    isa::reg::{Reg, writable},
     masm::{
-        Extend, Imm, IntCmpKind, LaneSelector, LoadKind, MacroAssembler, OperandSize, RegImm,
-        RmwOp, SPOffset, ShiftKind, StoreKind, TrapCode, Zero, UNTRUSTED_FLAGS,
+        AtomicWaitKind, Extend, Imm, IntCmpKind, LaneSelector, LoadKind, MacroAssembler,
+        OperandSize, RegImm, RmwOp, SPOffset, ShiftKind, StoreKind, TrapCode, UNTRUSTED_FLAGS,
+        Zero,
     },
     stack::TypedReg,
 };
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use cranelift_codegen::{
     binemit::CodeOffset,
     ir::{RelSourceLoc, SourceLoc},
@@ -16,13 +17,13 @@ use cranelift_codegen::{
 use smallvec::SmallVec;
 use std::marker::PhantomData;
 use wasmparser::{
-    BinaryReader, FuncValidator, MemArg, Operator, ValidatorResources, VisitOperator,
-    VisitSimdOperator,
+    BinaryReader, FuncValidator, MemArg, Operator, OperatorsReader, ValidatorResources,
+    VisitOperator, VisitSimdOperator,
 };
 use wasmtime_cranelift::{TRAP_BAD_SIGNATURE, TRAP_HEAP_MISALIGNED, TRAP_TABLE_OUT_OF_BOUNDS};
 use wasmtime_environ::{
-    GlobalIndex, MemoryIndex, PtrSize, TableIndex, Tunables, TypeIndex, WasmHeapType, WasmValType,
-    FUNCREF_MASK,
+    FUNCREF_MASK, GlobalIndex, MemoryIndex, PtrSize, TableIndex, Tunables, TypeIndex, WasmHeapType,
+    WasmValType,
 };
 
 mod context;
@@ -45,6 +46,32 @@ pub(crate) use phase::*;
 mod error;
 pub(crate) use error::*;
 
+/// Branch states in the compiler, enabling the derivation of the
+/// reachability state.
+pub(crate) trait BranchState {
+    /// Whether the compiler will enter in an unreachable state after
+    /// the branch is emitted.
+    fn unreachable_state_after_emission() -> bool;
+}
+
+/// A conditional branch state, with a fallthrough.
+pub(crate) struct ConditionalBranch;
+
+impl BranchState for ConditionalBranch {
+    fn unreachable_state_after_emission() -> bool {
+        false
+    }
+}
+
+/// Unconditional branch state.
+pub(crate) struct UnconditionalBranch;
+
+impl BranchState for UnconditionalBranch {
+    fn unreachable_state_after_emission() -> bool {
+        true
+    }
+}
+
 /// Holds metadata about the source code location and the machine code emission.
 /// The fields of this struct are opaque and are not interpreted in any way.
 /// They serve as a mapping between source code and machine code.
@@ -55,13 +82,6 @@ pub(crate) struct SourceLocation {
     /// The current relative source code location along with its associated
     /// machine code offset.
     pub current: (CodeOffset, RelSourceLoc),
-}
-
-/// Represents the `memory.atomic.wait*` kind.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum AtomicWaitKind {
-    Wait32,
-    Wait64,
 }
 
 /// The code generation abstraction.
@@ -130,8 +150,7 @@ where
             .params()
             .first()
             .ok_or_else(|| anyhow!(CodeGenError::vmcontext_arg_expected()))?
-            .unwrap_reg()
-            .into();
+            .unwrap_reg();
 
         self.masm.start_source_loc(Default::default())?;
         // We need to use the vmctx parameter before pinning it for stack checking.
@@ -201,7 +220,7 @@ where
                         }
                         Ref(rt) => match rt.heap_type {
                             WasmHeapType::Func | WasmHeapType::Extern => {
-                                self.masm.store_ptr((*reg).into(), addr)?;
+                                self.masm.store_ptr(*reg, addr)?;
                             }
                             _ => bail!(CodeGenError::unsupported_wasm_type()),
                         },
@@ -222,7 +241,7 @@ where
     /// Emit the function body to machine code.
     pub fn emit(
         &mut self,
-        body: &mut BinaryReader<'a>,
+        body: BinaryReader<'a>,
         validator: &mut FuncValidator<ValidatorResources>,
     ) -> Result<()> {
         self.emit_body(body, validator)
@@ -293,7 +312,7 @@ where
 
     fn emit_body(
         &mut self,
-        body: &mut BinaryReader<'a>,
+        body: BinaryReader<'a>,
         validator: &mut FuncValidator<ValidatorResources>,
     ) -> Result<()> {
         self.maybe_emit_fuel_check()?;
@@ -318,15 +337,16 @@ where
                 .set_ret_area(RetArea::slot(self.context.frame.results_base_slot.unwrap()));
         }
 
-        while !body.eof() {
-            let offset = body.original_position();
-            body.visit_operator(&mut ValidateThenVisit(
+        let mut ops = OperatorsReader::new(body);
+        while !ops.eof() {
+            let offset = ops.original_position();
+            ops.visit_operator(&mut ValidateThenVisit(
                 validator.simd_visitor(offset),
                 self,
                 offset,
             ))??;
         }
-        validator.finish(body.original_position())?;
+        ops.finish()?;
         return Ok(());
 
         struct ValidateThenVisit<'a, T, U>(T, &'a mut U, usize);
@@ -558,13 +578,10 @@ where
         // avoid conflict at the control flow merge below. Requesting the result
         // register is safe since we know ahead-of-time the builtin's signature.
         self.context.spill(self.masm)?;
-        let elem_value: Reg = self
-            .context
-            .reg(
-                builtin.sig().results.unwrap_singleton().unwrap_reg(),
-                self.masm,
-            )?
-            .into();
+        let elem_value: Reg = self.context.reg(
+            builtin.sig().results.unwrap_singleton().unwrap_reg(),
+            self.masm,
+        )?;
 
         let index = self.context.pop_to_reg(self.masm, None)?;
         let base = self.context.any_gpr(self.masm)?;
@@ -753,7 +770,7 @@ where
                 |masm, bounds, _| {
                     let bounds_reg = bounds.as_typed_reg().reg;
                     masm.cmp(
-                        index_offset_and_access_size.into(),
+                        index_offset_and_access_size,
                         bounds_reg.into(),
                         // We use the pointer size to keep the bounds
                         // comparison consistent with the result of the
@@ -961,7 +978,7 @@ where
 
         if let Some(addr) = maybe_addr {
             self.masm
-                .wasm_store(src.reg.into(), self.masm.address_at_reg(addr, 0)?, kind)?;
+                .wasm_store(src.reg, self.masm.address_at_reg(addr, 0)?, kind)?;
 
             self.context.free_reg(addr);
         }
@@ -1000,8 +1017,7 @@ where
             .masm
             .address_at_reg(base, table_data.current_elems_offset)?;
         let bound_size = table_data.current_elements_size;
-        self.masm
-            .load(bound_addr, writable!(bound), bound_size.into())?;
+        self.masm.load(bound_addr, writable!(bound), bound_size)?;
         self.masm.cmp(index, bound.into(), bound_size)?;
         self.masm
             .trapif(IntCmpKind::GeU, TRAP_TABLE_OUT_OF_BOUNDS)?;
@@ -1057,11 +1073,8 @@ where
         let size_addr = self
             .masm
             .address_at_reg(scratch, table_data.current_elems_offset)?;
-        self.masm.load(
-            size_addr,
-            writable!(size),
-            table_data.current_elements_size.into(),
-        )?;
+        self.masm
+            .load(size_addr, writable!(size), table_data.current_elements_size)?;
 
         self.context.stack.push(TypedReg::i32(size).into());
         Ok(())

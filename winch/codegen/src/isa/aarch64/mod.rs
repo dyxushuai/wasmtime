@@ -1,7 +1,8 @@
 use self::regs::{ALL_GPR, MAX_FPR, MAX_GPR, NON_ALLOCATABLE_GPR};
 use crate::isa::aarch64::regs::{ALL_FPR, NON_ALLOCATABLE_FPR};
 use crate::{
-    abi::{wasm_sig, ABI},
+    BuiltinFunctions,
+    abi::{ABI, wasm_sig},
     codegen::{CodeGen, CodeGenContext, FuncEnv, TypeConverter},
     frame::{DefinedLocals, Frame},
     isa::{Builder, TargetIsa},
@@ -9,11 +10,10 @@ use crate::{
     regalloc::RegAlloc,
     regset::RegBitSet,
     stack::Stack,
-    BuiltinFunctions,
 };
 use anyhow::Result;
 use cranelift_codegen::settings::{self, Flags};
-use cranelift_codegen::{isa::aarch64::settings as aarch64_settings, Final, MachBufferFinalized};
+use cranelift_codegen::{Final, MachBufferFinalized, isa::aarch64::settings as aarch64_settings};
 use cranelift_codegen::{MachTextSectionBuilder, TextSectionBuilder};
 use masm::MacroAssembler as Aarch64Masm;
 use target_lexicon::Triple;
@@ -126,7 +126,7 @@ impl TargetIsa for Aarch64 {
         let codegen = CodeGen::new(tunables, &mut masm, codegen_context, env, abi_sig);
 
         let mut body_codegen = codegen.emit_prologue()?;
-        body_codegen.emit(&mut body, validator)?;
+        body_codegen.emit(body, validator)?;
         let names = body_codegen.env.take_name_map();
         let base = body_codegen.source_location.base;
         Ok(CompiledFunction::new(

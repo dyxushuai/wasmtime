@@ -1,9 +1,9 @@
 use crate::prelude::*;
 use crate::{
-    store::{AutoAssertNoGc, StoreData, StoreOpaque, Stored},
-    trampoline::generate_global_export,
     AnyRef, AsContext, AsContextMut, ExternRef, Func, GlobalType, HeapType, Mutability, Ref,
     RootedGcRefImpl, Val, ValType,
+    store::{AutoAssertNoGc, StoreData, StoreOpaque, Stored},
+    trampoline::generate_global_export,
 };
 use core::ptr;
 use wasmtime_environ::TypeTrace;
@@ -121,15 +121,10 @@ impl Global {
 
                         HeapType::NoFunc => Ref::Func(None),
 
-                        HeapType::Extern => Ref::Extern(
-                            definition
-                                .as_gc_ref()
-                                .map(|r| {
-                                    let r = store.unwrap_gc_store_mut().clone_gc_ref(r);
-                                    ExternRef::from_cloned_gc_ref(&mut store, r)
-                                })
-                                .into(),
-                        ),
+                        HeapType::Extern => Ref::Extern(definition.as_gc_ref().map(|r| {
+                            let r = store.unwrap_gc_store_mut().clone_gc_ref(r);
+                            ExternRef::from_cloned_gc_ref(&mut store, r)
+                        })),
 
                         HeapType::NoExtern => Ref::Extern(None),
 
@@ -237,10 +232,12 @@ impl Global {
         wasmtime_export: crate::runtime::vm::ExportGlobal,
         store: &mut StoreOpaque,
     ) -> Global {
-        debug_assert!(wasmtime_export
-            .global
-            .wasm_ty
-            .is_canonicalized_for_runtime_usage());
+        debug_assert!(
+            wasmtime_export
+                .global
+                .wasm_ty
+                .is_canonicalized_for_runtime_usage()
+        );
         Global(store.store_data_mut().insert(wasmtime_export))
     }
 

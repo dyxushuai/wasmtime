@@ -115,9 +115,9 @@
 //! time this may want to be revisited if too many adapter modules are being
 //! created.
 
+use crate::EntityType;
 use crate::component::translate::*;
 use crate::fact;
-use crate::EntityType;
 use std::collections::HashSet;
 
 /// Metadata information about a fused adapter.
@@ -246,7 +246,7 @@ impl<'data> Translator<'_, 'data> {
                 .map(|(arg, (_, _, ty))| fact_import_to_core_def(component, arg, ty))
                 .collect::<Vec<_>>();
             let static_index = self.static_modules.push(translation);
-            let id = component.adapter_modules.push((static_index, args.into()));
+            let id = component.adapter_modules.push((static_index, args));
             assert_eq!(id, module_id);
         }
     }

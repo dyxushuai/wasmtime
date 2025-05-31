@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
-use test_programs_artifacts::{foreach_tls, TLS_SAMPLE_APPLICATION_COMPONENT};
+use anyhow::{Result, anyhow};
+use test_programs_artifacts::{TLS_SAMPLE_APPLICATION_COMPONENT, foreach_tls};
 use wasmtime::{
-    component::{Component, Linker, ResourceTable},
     Store,
+    component::{Component, Linker, ResourceTable},
 };
-use wasmtime_wasi::{bindings::Command, IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView, bindings::Command};
 use wasmtime_wasi_tls::{LinkOptions, WasiTlsCtx};
 
 struct Ctx {
@@ -31,7 +31,7 @@ async fn run_wasi(path: &str, ctx: Ctx) -> Result<()> {
     let component = Component::from_file(&engine, path)?;
 
     let mut linker = Linker::new(&engine);
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     let mut opts = LinkOptions::default();
     opts.tls(true);
     wasmtime_wasi_tls::add_to_linker(&mut linker, &mut opts, |h: &mut Ctx| {

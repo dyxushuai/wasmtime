@@ -1,7 +1,6 @@
 //! Generate format-related Rust code; this also includes generation of encoding
 //! Rust code.
-
-use super::{fmtln, Formatter};
+use super::{Formatter, fmtln};
 use crate::dsl;
 
 impl dsl::Format {
@@ -14,21 +13,44 @@ impl dsl::Format {
     /// once Cranelift has switched to using this assembler predominantly
     /// (TODO).
     #[must_use]
-    pub fn generate_att_style_operands(&self) -> String {
+    pub(crate) fn generate_att_style_operands(&self) -> String {
         let ordered_ops: Vec<_> = self
             .operands
             .iter()
+            .filter(|o| !o.implicit)
             .rev()
             .map(|o| format!("{{{}}}", o.location))
             .collect();
         ordered_ops.join(", ")
     }
 
-    pub fn generate_rex_encoding(&self, f: &mut Formatter, rex: &dsl::Rex) {
+    #[must_use]
+    pub(crate) fn generate_implicit_operands(&self) -> String {
+        let ops: Vec<_> = self
+            .operands
+            .iter()
+            .filter(|o| o.implicit)
+            .map(|o| format!("{{{}}}", o.location))
+            .collect();
+        if ops.is_empty() {
+            String::new()
+        } else {
+            format!(" ;; implicit: {}", ops.join(", "))
+        }
+    }
+
+    pub(crate) fn generate_rex_encoding(&self, f: &mut Formatter, rex: &dsl::Rex) {
         self.generate_prefixes(f, rex);
         self.generate_rex_prefix(f, rex);
-        self.generate_opcodes(f, rex);
-        self.generate_modrm_byte(f, rex);
+        rex.generate_opcodes(f, self.locations().next());
+        self.generate_modrm_byte(f, rex.opcode_mod, rex.modrm);
+        self.generate_immediate(f);
+    }
+
+    pub fn generate_vex_encoding(&self, f: &mut Formatter, vex: &dsl::Vex) {
+        self.generate_vex_prefix(f, vex);
+        vex.generate_opcode(f);
+        self.generate_modrm_byte(f, None, vex.modrm);
         self.generate_immediate(f);
     }
 
@@ -52,152 +74,180 @@ impl dsl::Format {
         }
     }
 
-    // `buf.put1(...);`
-    fn generate_opcodes(&self, f: &mut Formatter, rex: &dsl::Rex) {
-        f.empty_line();
-        f.comment("Emit opcode(s).");
-        if rex.opcodes.escape {
-            fmtln!(f, "buf.put1(0x0f);");
-        }
-        fmtln!(f, "buf.put1(0x{:x});", rex.opcodes.primary);
-        if let Some(secondary) = rex.opcodes.secondary {
-            fmtln!(f, "buf.put1(0x{:x});", secondary);
-        }
-    }
-
     fn generate_rex_prefix(&self, f: &mut Formatter, rex: &dsl::Rex) {
         use dsl::OperandKind::{FixedReg, Imm, Mem, Reg, RegMem};
         f.empty_line();
-        f.comment("Emit REX prefix.");
+        f.comment("Possibly emit REX prefix.");
 
-        let find_8bit_registers = |l: &dsl::Location| l.bits() == 8 && matches!(l.kind(), Reg(_) | RegMem(_));
-        if self.locations().any(find_8bit_registers) {
-            fmtln!(f, "let mut rex = {};", rex.generate_flags());
-            for op in self.locations().copied().filter(find_8bit_registers) {
-                fmtln!(f, "self.{op}.always_emit_if_8bit_needed(&mut rex);");
-            }
-        } else {
-            fmtln!(f, "let rex = {};", rex.generate_flags());
-        }
+        let find_8bit_registers =
+            |l: &dsl::Location| l.bits() == 8 && matches!(l.kind(), Reg(_) | RegMem(_));
+        let uses_8bit = self.locations().any(find_8bit_registers);
+        fmtln!(f, "let uses_8bit = {uses_8bit};");
+        fmtln!(f, "let w_bit = {};", rex.w);
+        let bits = "w_bit, uses_8bit";
 
         match self.operands_by_kind().as_slice() {
-            [FixedReg(dst), Imm(_)] => {
+            [FixedReg(dst), FixedReg(_)] | [FixedReg(dst)] | [FixedReg(dst), Imm(_)] => {
                 // TODO: don't emit REX byte here.
-                fmtln!(f, "let {dst} = {};", dst.generate_fixed_reg().unwrap());
-                assert_eq!(rex.digit, None, "we expect no digit for operands: [FixedReg, Imm]");
+                assert_eq!(rex.unwrap_digit(), None);
                 fmtln!(f, "let digit = 0;");
-                fmtln!(f, "rex.emit_two_op(buf, digit, {dst}.enc());");
+                fmtln!(f, "let dst = self.{dst}.enc();");
+                fmtln!(f, "let rex = RexPrefix::with_digit(digit, dst, {bits});");
             }
-            [Mem(dst), Imm(_)] => {
-                let digit = rex.digit.expect("REX digit must be set for operands: [Mem, Imm]");
+            [Reg(dst)] => {
+                assert_eq!(rex.unwrap_digit(), None);
+                assert!(rex.opcode_mod.is_some());
+                fmtln!(f, "let dst = self.{dst}.enc();");
+                fmtln!(f, "let rex = RexPrefix::one_op(dst, {bits});");
+            }
+            [Reg(dst), Imm(_)] => match rex.unwrap_digit() {
+                Some(digit) => {
+                    fmtln!(f, "let digit = 0x{digit:x};");
+                    fmtln!(f, "let dst = self.{dst}.enc();");
+                    fmtln!(f, "let rex = RexPrefix::two_op(digit, dst, {bits});");
+                }
+                None => {
+                    assert!(rex.opcode_mod.is_some());
+                    fmtln!(f, "let dst = self.{dst}.enc();");
+                    fmtln!(f, "let rex = RexPrefix::one_op(dst, {bits});");
+                }
+            },
+            [FixedReg(_), RegMem(mem)]
+            | [FixedReg(_), FixedReg(_), RegMem(mem)]
+            | [RegMem(mem), FixedReg(_)] => {
+                let digit = rex.unwrap_digit().unwrap();
                 fmtln!(f, "let digit = 0x{digit:x};");
-                fmtln!(f, "self.{dst}.emit_rex_prefix(rex, digit, buf);");
+                fmtln!(f, "let rex = self.{mem}.as_rex_prefix(digit, {bits});");
             }
-            [RegMem(dst), Imm(_)] => {
-                let digit = rex.digit.expect("REX digit must be set for operands: [RegMem, Imm]");
+            [Mem(dst), Imm(_)] | [RegMem(dst), Imm(_)] | [RegMem(dst)] => {
+                let digit = rex.unwrap_digit().unwrap();
                 fmtln!(f, "let digit = 0x{digit:x};");
-                f.add_block(&format!("match &self.{dst}"), |f| {
-                    fmtln!(f, "GprMem::Gpr({dst}) => rex.emit_two_op(buf, digit, {dst}.enc()),");
-                    fmtln!(f, "GprMem::Mem({dst}) => {dst}.emit_rex_prefix(rex, digit, buf),");
-                });
+                fmtln!(f, "let rex = self.{dst}.as_rex_prefix(digit, {bits});");
             }
-            [Reg(dst), RegMem(src)] => {
-                fmtln!(f, "let {dst} = self.{dst}.enc();");
-                f.add_block(&format!("match &self.{src}"), |f| {
-                    match dst.bits() {
-                        128 => {
-                            fmtln!(f, "XmmMem::Xmm({src}) => rex.emit_two_op(buf, {dst}, {src}.enc()),");
-                            fmtln!(f, "XmmMem::Mem({src}) => {src}.emit_rex_prefix(rex, {dst}, buf),");
-                        }
-                        _ => {
-                            fmtln!(f, "GprMem::Gpr({src}) => rex.emit_two_op(buf, {dst}, {src}.enc()),");
-                            fmtln!(f, "GprMem::Mem({src}) => {src}.emit_rex_prefix(rex, {dst}, buf),");
-                        }
-                    };
-                });
+            [Reg(dst), RegMem(src)] | [Reg(dst), RegMem(src), Imm(_)] | [Reg(dst), Mem(src)] => {
+                fmtln!(f, "let dst = self.{dst}.enc();");
+                fmtln!(f, "let rex = self.{src}.as_rex_prefix(dst, {bits});");
             }
             [Mem(dst), Reg(src)] => {
-                fmtln!(f, "let {src} = self.{src}.enc();");
-                fmtln!(f, "self.{dst}.emit_rex_prefix(rex, {src}, buf);");
+                fmtln!(f, "let src = self.{src}.enc();");
+                fmtln!(f, "let rex = self.{dst}.as_rex_prefix(src, {bits});");
             }
-            [RegMem(dst), Reg(src)] | [RegMem(dst), Reg(src), Imm(_)] | [RegMem(dst), Reg(src), FixedReg(_)] => {
-                fmtln!(f, "let {src} = self.{src}.enc();");
-                f.add_block(&format!("match &self.{dst}"), |f| match src.bits() {
-                    128 => {
-                        fmtln!(f, "XmmMem::Xmm({dst}) => rex.emit_two_op(buf, {src}, {dst}.enc()),");
-                        fmtln!(f, "XmmMem::Mem({dst}) => {dst}.emit_rex_prefix(rex, {src}, buf),");
-                    }
-                    _ => {
-                        fmtln!(f, "GprMem::Gpr({dst}) => rex.emit_two_op(buf, {src}, {dst}.enc()),");
-                        fmtln!(f, "GprMem::Mem({dst}) => {dst}.emit_rex_prefix(rex, {src}, buf),");
-                    }
-                });
+            [RegMem(dst), Reg(src)]
+            | [RegMem(dst), Reg(src), Imm(_)]
+            | [RegMem(dst), Reg(src), FixedReg(_)] => {
+                fmtln!(f, "let src = self.{src}.enc();");
+                fmtln!(f, "let rex = self.{dst}.as_rex_prefix(src, {bits});");
             }
-
+            [Reg(dst), Reg(xmm2), Imm(_)] | [Reg(dst), Reg(xmm2)] => {
+                fmtln!(f, "let reg = self.{dst}.enc();");
+                fmtln!(f, "let rm = self.{xmm2}.enc();");
+                fmtln!(f, "let rex = RexPrefix::two_op(reg, rm, {bits});");
+            }
             unknown => unimplemented!("unknown pattern: {unknown:?}"),
         }
+
+        fmtln!(f, "rex.encode(buf);");
     }
 
-    fn generate_modrm_byte(&self, f: &mut Formatter, rex: &dsl::Rex) {
-        use dsl::OperandKind::{FixedReg, Imm, Mem, Reg, RegMem};
-
-        if let [FixedReg(_), Imm(_)] = self.operands_by_kind().as_slice() {
-            // No need to emit a comment.
-        } else {
-            f.empty_line();
-            f.comment("Emit ModR/M byte.");
-        }
+    fn generate_vex_prefix(&self, f: &mut Formatter, vex: &dsl::Vex) {
+        use dsl::OperandKind::{Imm, Reg, RegMem};
+        f.empty_line();
+        f.comment("Emit VEX prefix.");
+        fmtln!(f, "let len = {:#03b};", vex.length.bits());
+        fmtln!(f, "let pp = {:#04b};", vex.pp.map_or(0b00, |pp| pp.bits()));
+        fmtln!(f, "let mmmmm = {:#07b};", vex.mmmmm.unwrap().bits());
+        fmtln!(f, "let w = {};", vex.w.as_bool());
+        let bits = "len, pp, mmmmm, w";
 
         match self.operands_by_kind().as_slice() {
-            [FixedReg(_), Imm(_)] => {
-                // No need to emit a ModRM byte: we know the register used.
+            [Reg(reg), Reg(vvvv), RegMem(rm)] => {
+                fmtln!(f, "let reg = self.{reg}.enc();");
+                fmtln!(f, "let vvvv = self.{vvvv}.enc();");
+                fmtln!(f, "let rm = self.{rm}.encode_bx_regs();");
+                fmtln!(f, "let vex = VexPrefix::three_op(reg, vvvv, rm, {bits});");
             }
-            [Mem(dst), Imm(_)] => {
-                let digit = rex.digit.expect("REX digit must be set for operands: [RegMem, Imm]");
+            [Reg(reg), RegMem(rm), Imm(_imm8)] => {
+                fmtln!(f, "let reg = self.{reg}.enc();");
+                fmtln!(f, "let vvvv = {};", "0b0");
+                fmtln!(f, "let rm = self.{rm}.encode_bx_regs();");
+                fmtln!(f, "let vex = VexPrefix::three_op(reg, vvvv, rm, {bits});");
+            }
+            [Reg(reg), Reg(vvvv), RegMem(rm), Imm(_imm8)] => {
+                fmtln!(f, "let reg = self.{reg}.enc();");
+                fmtln!(f, "let vvvv = self.{vvvv}.enc();");
+                fmtln!(f, "let rm = self.{rm}.encode_bx_regs();");
+                fmtln!(f, "let vex = VexPrefix::three_op(reg, vvvv, rm, {bits});");
+            }
+            unknown => unimplemented!("unknown pattern: {unknown:?}"),
+        }
+
+        fmtln!(f, "vex.encode(buf);");
+    }
+
+    fn generate_modrm_byte(
+        &self,
+        f: &mut Formatter,
+        opcode_mod: Option<dsl::OpcodeMod>,
+        digit: Option<dsl::ModRmKind>,
+    ) {
+        use dsl::OperandKind::{FixedReg, Imm, Mem, Reg, RegMem};
+
+        // Some instructions will never emit a ModR/M byte.
+        let operands = self.operands_by_kind();
+        if opcode_mod.is_some()
+            || matches!(
+                operands.as_slice(),
+                [FixedReg(_)] | [FixedReg(_), FixedReg(_)] | [FixedReg(_), Imm(_)]
+            )
+        {
+            f.empty_line();
+            f.comment("No need to emit a ModRM byte.");
+            return;
+        }
+
+        // If we must, emit the ModR/M byte and the SIB byte (if necessary).
+        f.empty_line();
+        f.comment("Emit ModR/M byte.");
+        let bytes_at_end = match operands.as_slice() {
+            [.., Imm(imm)] => imm.bytes(),
+            _ => 0,
+        };
+        match operands.as_slice() {
+            [Reg(reg), Imm(_)] => {
+                let digit = digit.unwrap().unwrap_digit();
                 fmtln!(f, "let digit = 0x{digit:x};");
-                fmtln!(f, "emit_modrm_sib_disp(buf, off, digit, &self.{dst}, 0, None);");
+                fmtln!(f, "self.{reg}.encode_modrm(buf, digit);");
             }
-            [RegMem(dst), Imm(_)] => {
-                let digit = rex.digit.expect("REX digit must be set for operands: [RegMem, Imm]");
+            [Mem(mem), Imm(_)]
+            | [RegMem(mem), Imm(_)]
+            | [RegMem(mem)]
+            | [FixedReg(_), RegMem(mem)]
+            | [RegMem(mem), FixedReg(_)]
+            | [FixedReg(_), FixedReg(_), RegMem(mem)] => {
+                let digit = digit.unwrap().unwrap_digit();
                 fmtln!(f, "let digit = 0x{digit:x};");
-                f.add_block(&format!("match &self.{dst}"), |f| {
-                    fmtln!(f, "GprMem::Gpr({dst}) => emit_modrm(buf, digit, {dst}.enc()),");
-                    fmtln!(f, "GprMem::Mem({dst}) => emit_modrm_sib_disp(buf, off, digit, {dst}, 0, None),");
-                });
+                fmtln!(
+                    f,
+                    "self.{mem}.encode_rex_suffixes(buf, off, digit, {bytes_at_end});"
+                );
             }
-            [Reg(dst), RegMem(src)] => {
-                fmtln!(f, "let {dst} = self.{dst}.enc();");
-                f.add_block(&format!("match &self.{src}"), |f| {
-                    match dst.bits() {
-                        128 => {
-                            fmtln!(f, "XmmMem::Xmm({src}) => emit_modrm(buf, {dst}, {src}.enc()),");
-                            fmtln!(f, "XmmMem::Mem({src}) => emit_modrm_sib_disp(buf, off, {dst}, {src}, 0, None),");
-                        }
-                        _ => {
-                            fmtln!(f, "GprMem::Gpr({src}) => emit_modrm(buf, {dst}, {src}.enc()),");
-                            fmtln!(f, "GprMem::Mem({src}) => emit_modrm_sib_disp(buf, off, {dst}, {src}, 0, None),");
-                        }
-                    };
-                });
+            [Reg(reg), RegMem(mem)]
+            | [Reg(reg), RegMem(mem), Imm(_)]
+            | [Mem(mem), Reg(reg)]
+            | [Reg(reg), Reg(_), RegMem(mem)]
+            | [RegMem(mem), Reg(reg)]
+            | [RegMem(mem), Reg(reg), Imm(_)]
+            | [RegMem(mem), Reg(reg), FixedReg(_)]
+            | [Reg(reg), Reg(_), RegMem(mem), Imm(_)]
+            | [Reg(reg), Mem(mem)] => {
+                fmtln!(f, "let reg = self.{reg}.enc();");
+                fmtln!(
+                    f,
+                    "self.{mem}.encode_rex_suffixes(buf, off, reg, {bytes_at_end});"
+                );
             }
-            [Mem(dst), Reg(src)] => {
-                fmtln!(f, "let {src} = self.{src}.enc();");
-                fmtln!(f, "emit_modrm_sib_disp(buf, off, {src}, &self.{dst}, 0, None);");
-            }
-            [RegMem(dst), Reg(src)] | [RegMem(dst), Reg(src), Imm(_)] | [RegMem(dst), Reg(src), FixedReg(_)] => {
-                fmtln!(f, "let {src} = self.{src}.enc();");
-                f.add_block(&format!("match &self.{dst}"), |f| {
-                    match src.bits() {
-                        128 => {
-                            fmtln!(f, "XmmMem::Xmm({dst}) => emit_modrm(buf, {src}, {dst}.enc()),");
-                            fmtln!(f, "XmmMem::Mem({dst}) => emit_modrm_sib_disp(buf, off, {src}, {dst}, 0, None),");
-                        }
-                        _ => {
-                            fmtln!(f, "GprMem::Gpr({dst}) => emit_modrm(buf, {src}, {dst}.enc()),");
-                            fmtln!(f, "GprMem::Mem({dst}) => emit_modrm_sib_disp(buf, off, {src}, {dst}, 0, None),");
-                        }
-                    };
-                });
+            [Reg(dst), Reg(xmm2), Imm(_)] | [Reg(dst), Reg(xmm2)] => {
+                fmtln!(f, "self.{xmm2}.encode_modrm(buf, self.{dst}.enc());");
             }
             unknown => unimplemented!("unknown pattern: {unknown:?}"),
         }
@@ -208,7 +258,6 @@ impl dsl::Format {
         match self.operands_by_kind().as_slice() {
             [prefix @ .., Imm(imm)] => {
                 assert!(!prefix.iter().any(|o| matches!(o, Imm(_))));
-
                 f.empty_line();
                 f.comment("Emit immediate.");
                 fmtln!(f, "self.{imm}.encode(buf);");
@@ -222,11 +271,32 @@ impl dsl::Format {
 }
 
 impl dsl::Rex {
-    fn generate_flags(&self) -> &str {
-        if self.w {
-            "RexFlags::set_w()"
-        } else {
-            "RexFlags::clear_w()"
+    // `buf.put1(...);`
+    fn generate_opcodes(&self, f: &mut Formatter, first_op: Option<&dsl::Location>) {
+        f.empty_line();
+        f.comment("Emit opcode(s).");
+        if self.opcodes.escape {
+            fmtln!(f, "buf.put1(0x0f);");
         }
+        if self.opcode_mod.is_some() {
+            let first_op = first_op.expect("Expected first operand for opcode_mod");
+            assert!(matches!(first_op.kind(), dsl::OperandKind::Reg(_)));
+            fmtln!(f, "let low_bits = self.{first_op}.enc() & 0b111;");
+            fmtln!(f, "buf.put1(0x{:x} | low_bits);", self.opcodes.primary);
+        } else {
+            fmtln!(f, "buf.put1(0x{:x});", self.opcodes.primary);
+        }
+        if let Some(secondary) = self.opcodes.secondary {
+            fmtln!(f, "buf.put1(0x{:x});", secondary);
+        }
+    }
+}
+
+impl dsl::Vex {
+    // `buf.put1(...);`
+    fn generate_opcode(&self, f: &mut Formatter) {
+        f.empty_line();
+        f.comment("Emit opcode.");
+        fmtln!(f, "buf.put1(0x{:x});", self.opcode);
     }
 }

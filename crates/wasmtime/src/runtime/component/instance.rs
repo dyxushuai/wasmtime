@@ -1,7 +1,8 @@
 use crate::component::func::HostFunc;
 use crate::component::matching::InstanceType;
 use crate::component::{
-    Component, ComponentExportIndex, ComponentNamedList, Func, Lift, Lower, ResourceType, TypedFunc,
+    Component, ComponentExportIndex, ComponentNamedList, Func, Lift, Lower, ResourceType,
+    TypedFunc, types::ComponentItem,
 };
 use crate::instance::OwnedImports;
 use crate::linker::DefinitionType;
@@ -9,11 +10,11 @@ use crate::prelude::*;
 use crate::runtime::vm::component::{ComponentInstance, OwnedComponentInstance};
 use crate::runtime::vm::{CompiledModuleId, VMFuncRef};
 use crate::store::{StoreOpaque, Stored};
-use crate::{AsContextMut, Engine, Module, StoreContextMut};
+use crate::{AsContext, AsContextMut, Engine, Module, StoreContextMut};
 use alloc::sync::Arc;
 use core::marker;
 use core::ptr::NonNull;
-use wasmtime_environ::{component::*, EngineOrModuleTypeIndex};
+use wasmtime_environ::{EngineOrModuleTypeIndex, component::*};
 use wasmtime_environ::{EntityIndex, EntityType, Global, PrimaryMap, WasmValType};
 
 /// An instantiated component.
@@ -111,7 +112,7 @@ impl Instance {
     /// let func = instance.get_func(&mut store, "f").unwrap();
     ///
     /// // The function can also be looked up by an index via a precomputed index.
-    /// let (_, export) = component.export_index(None, "f").unwrap();
+    /// let export = component.get_export_index(None, "f").unwrap();
     /// let func = instance.get_func(&mut store, &export).unwrap();
     /// # Ok(())
     /// # }
@@ -145,8 +146,8 @@ impl Instance {
     ///
     /// // First look up the exported instance, then use that to lookup the
     /// // exported function.
-    /// let (_, instance_index) = component.export_index(None, "i").unwrap();
-    /// let (_, func_index) = component.export_index(Some(&instance_index), "f").unwrap();
+    /// let instance_index = component.get_export_index(None, "i").unwrap();
+    /// let func_index = component.get_export_index(Some(&instance_index), "f").unwrap();
     ///
     /// // Then use `func_index` at runtime.
     /// let mut store = Store::new(&engine, ());
@@ -154,9 +155,9 @@ impl Instance {
     /// let func = instance.get_func(&mut store, &func_index).unwrap();
     ///
     /// // Alternatively the `instance` can be used directly in conjunction with
-    /// // the `get_export` method.
-    /// let instance_index = instance.get_export(&mut store, None, "i").unwrap();
-    /// let func_index = instance.get_export(&mut store, Some(&instance_index), "f").unwrap();
+    /// // the `get_export_index` method.
+    /// let instance_index = instance.get_export_index(&mut store, None, "i").unwrap();
+    /// let func_index = instance.get_export_index(&mut store, Some(&instance_index), "f").unwrap();
     /// let func = instance.get_func(&mut store, &func_index).unwrap();
     /// # Ok(())
     /// # }
@@ -275,12 +276,17 @@ impl Instance {
         }
     }
 
-    /// A methods similar to [`Component::export_index`] except for this
+    /// A methods similar to [`Component::get_export`] except for this
     /// instance.
     ///
     /// This method will lookup the `name` provided within the `instance`
-    /// provided and return a [`ComponentExportIndex`] which can be used to
-    /// pass to other `get_*` functions like [`Instance::get_func`].
+    /// provided and return a [`ComponentItem`] describing the export,
+    /// and [`ComponentExportIndex`] which can be passed other `get_*`
+    /// functions like [`Instance::get_func`].
+    ///
+    /// The [`ComponentItem`] is more expensive to compute than the
+    /// [`ComponentExportIndex`]. If you are not consuming the
+    /// [`ComponentItem`], use [`Instance::get_export_index`] instead.
     ///
     /// # Panics
     ///
@@ -290,7 +296,7 @@ impl Instance {
         mut store: impl AsContextMut,
         instance: Option<&ComponentExportIndex>,
         name: &str,
-    ) -> Option<ComponentExportIndex> {
+    ) -> Option<(ComponentItem, ComponentExportIndex)> {
         self._get_export(store.as_context_mut().0, instance, name)
     }
 
@@ -299,8 +305,43 @@ impl Instance {
         store: &StoreOpaque,
         instance: Option<&ComponentExportIndex>,
         name: &str,
-    ) -> Option<ComponentExportIndex> {
+    ) -> Option<(ComponentItem, ComponentExportIndex)> {
         let data = store[self.0].as_ref().unwrap();
+        let index = data.component.lookup_export_index(instance, name)?;
+        let item = ComponentItem::from_export(
+            &store.engine(),
+            &data.component.env_component().export_items[index],
+            &data.ty(),
+        );
+        Some((
+            item,
+            ComponentExportIndex {
+                id: data.component_id(),
+                index,
+            },
+        ))
+    }
+
+    /// A methods similar to [`Component::get_export_index`] except for this
+    /// instance.
+    ///
+    /// This method will lookup the `name` provided within the `instance`
+    /// provided and return a [`ComponentExportIndex`] which can be passed
+    /// other `get_*` functions like [`Instance::get_func`].
+    ///
+    /// If you need the [`ComponentItem`] corresponding to this export, use
+    /// the [`Instance::get_export`] instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this instance.
+    pub fn get_export_index(
+        &self,
+        mut store: impl AsContextMut,
+        instance: Option<&ComponentExportIndex>,
+        name: &str,
+    ) -> Option<ComponentExportIndex> {
+        let data = store.as_context_mut().0[self.0].as_ref().unwrap();
         let index = data.component.lookup_export_index(instance, name)?;
         Some(ComponentExportIndex {
             id: data.component_id(),
@@ -320,6 +361,20 @@ impl Instance {
             &data.component.env_component().export_items[index],
             index,
         ))
+    }
+
+    /// Returns the [`InstancePre`] that was used to create this instance.
+    pub fn instance_pre<T>(&self, store: &impl AsContext<Data = T>) -> InstancePre<T> {
+        // This indexing operation asserts the Store owns the Instance.
+        // Therefore, the InstancePre<T> must match the Store<T>.
+        let data = store.as_context().0[self.0].as_ref().unwrap();
+        unsafe {
+            InstancePre::new_unchecked(
+                data.component.clone(),
+                data.imports.clone(),
+                data.instance().resource_types().clone(),
+            )
+        }
     }
 }
 
@@ -445,10 +500,7 @@ impl InstanceData {
     // though it should be guaranteed that the single owning reference currently
     // lives within the `ComponentInstance` that's being built.
     fn resource_types_mut(&mut self) -> &mut ImportedResources {
-        Arc::get_mut(self.state.resource_types_mut())
-            .unwrap()
-            .downcast_mut()
-            .unwrap()
+        Arc::get_mut(self.state.resource_types_mut()).unwrap()
     }
 }
 
@@ -774,24 +826,26 @@ impl<'a> Instantiator<'a> {
 /// type is created. This type is primarily created through the
 /// [`Linker::instantiate_pre`](crate::component::Linker::instantiate_pre)
 /// method.
-pub struct InstancePre<T> {
+pub struct InstancePre<T: 'static> {
     component: Component,
     imports: Arc<PrimaryMap<RuntimeImportIndex, RuntimeImport>>,
+    resource_types: Arc<PrimaryMap<ResourceIndex, ResourceType>>,
     _marker: marker::PhantomData<fn() -> T>,
 }
 
 // `InstancePre`'s clone does not require `T: Clone`
-impl<T> Clone for InstancePre<T> {
+impl<T: 'static> Clone for InstancePre<T> {
     fn clone(&self) -> Self {
         Self {
             component: self.component.clone(),
             imports: self.imports.clone(),
+            resource_types: self.resource_types.clone(),
             _marker: self._marker,
         }
     }
 }
 
-impl<T> InstancePre<T> {
+impl<T: 'static> InstancePre<T> {
     /// This function is `unsafe` since there's no guarantee that the
     /// `RuntimeImport` items provided are guaranteed to work with the `T` of
     /// the store.
@@ -800,11 +854,13 @@ impl<T> InstancePre<T> {
     /// satisfy the imports of the `component` provided.
     pub(crate) unsafe fn new_unchecked(
         component: Component,
-        imports: PrimaryMap<RuntimeImportIndex, RuntimeImport>,
+        imports: Arc<PrimaryMap<RuntimeImportIndex, RuntimeImport>>,
+        resource_types: Arc<PrimaryMap<ResourceIndex, ResourceType>>,
     ) -> InstancePre<T> {
         InstancePre {
             component,
-            imports: Arc::new(imports),
+            imports,
+            resource_types,
             _marker: marker::PhantomData,
         }
     }
@@ -812,6 +868,17 @@ impl<T> InstancePre<T> {
     /// Returns the underlying component that will be instantiated.
     pub fn component(&self) -> &Component {
         &self.component
+    }
+
+    #[doc(hidden)]
+    /// Returns the type at which the underlying component will be
+    /// instantiated. This contains the instantiated type information which
+    /// was determined by the Linker.
+    pub fn instance_type(&self) -> InstanceType<'_> {
+        InstanceType {
+            types: &self.component.types(),
+            resources: &self.resource_types,
+        }
     }
 
     /// Returns the underlying engine.

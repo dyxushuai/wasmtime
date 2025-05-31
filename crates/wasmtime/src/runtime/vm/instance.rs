@@ -16,8 +16,8 @@ use crate::runtime::vm::{
     ModuleRuntimeInfo, SendSyncPtr, VMFunctionBody, VMGcRef, VMStore, VMStoreRawPtr, VmPtr, VmSafe,
     WasmFault,
 };
-use crate::store::{StoreInner, StoreOpaque};
-use crate::{prelude::*, StoreContextMut};
+use crate::store::{InstanceId, StoreInner, StoreOpaque};
+use crate::{StoreContextMut, prelude::*};
 use alloc::sync::Arc;
 use core::alloc::Layout;
 use core::any::Any;
@@ -26,15 +26,14 @@ use core::ptr::NonNull;
 #[cfg(target_has_atomic = "64")]
 use core::sync::atomic::AtomicU64;
 use core::{mem, ptr};
-use sptr::Strict;
 #[cfg(feature = "gc")]
 use wasmtime_environ::ModuleInternedTypeIndex;
 use wasmtime_environ::{
-    packed_option::ReservedValue, DataIndex, DefinedGlobalIndex, DefinedMemoryIndex,
-    DefinedTableIndex, DefinedTagIndex, ElemIndex, EntityIndex, EntityRef, EntitySet, FuncIndex,
-    GlobalIndex, HostPtr, MemoryIndex, Module, PrimaryMap, PtrSize, TableIndex, TableInitialValue,
-    TableSegmentElements, TagIndex, Trap, VMOffsets, VMSharedTypeIndex, WasmHeapTopType,
-    VMCONTEXT_MAGIC,
+    DataIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, DefinedTagIndex,
+    ElemIndex, EntityIndex, EntityRef, EntitySet, FuncIndex, GlobalIndex, HostPtr, MemoryIndex,
+    Module, PrimaryMap, PtrSize, TableIndex, TableInitialValue, TableSegmentElements, TagIndex,
+    Trap, VMCONTEXT_MAGIC, VMOffsets, VMSharedTypeIndex, WasmHeapTopType,
+    packed_option::ReservedValue,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::Wmemcheck;
@@ -185,6 +184,9 @@ impl InstanceAndStore {
 /// values, whether or not they were created on the host or through a module.
 #[repr(C)] // ensure that the vmctx field is last.
 pub struct Instance {
+    /// The index, within a `Store` that this instance lives at
+    id: InstanceId,
+
     /// The runtime info (corresponding to the "compiled module"
     /// abstraction in higher layers) that is retained and needed for
     /// lazy initialization. This provides access to the underlying
@@ -318,6 +320,7 @@ impl Instance {
         ptr::write(
             ptr,
             Instance {
+                id: req.id,
                 runtime_info: req.runtime_info.clone(),
                 memories,
                 tables,
@@ -497,8 +500,9 @@ impl Instance {
         }
     }
 
-    /// Return the indexed `VMMemoryDefinition`.
-    fn memory(&self, index: DefinedMemoryIndex) -> VMMemoryDefinition {
+    /// Return the indexed `VMMemoryDefinition`, loaded from vmctx memory
+    /// already.
+    pub fn memory(&self, index: DefinedMemoryIndex) -> VMMemoryDefinition {
         unsafe { VMMemoryDefinition::load(self.memory_ptr(index).as_ptr()) }
     }
 
@@ -509,8 +513,11 @@ impl Instance {
         }
     }
 
-    /// Return the indexed `VMMemoryDefinition`.
-    fn memory_ptr(&self, index: DefinedMemoryIndex) -> NonNull<VMMemoryDefinition> {
+    /// Return the address of the specified memory at `index` within this vmctx.
+    ///
+    /// Note that the returned pointer resides in wasm-code-readable-memory in
+    /// the vmctx.
+    pub fn memory_ptr(&self, index: DefinedMemoryIndex) -> NonNull<VMMemoryDefinition> {
         let vmptr = unsafe {
             *self.vmctx_plus_offset::<VmPtr<_>>(self.offsets().vmctx_vmmemory_pointer(index))
         };
@@ -656,13 +663,8 @@ impl Instance {
         // (there's an actual load of the field) it does look like that by the
         // time the backend runs. (that's magic to me, the backend removing
         // loads...)
-        //
-        // As a final minor note, strict provenance APIs are not stable on Rust
-        // today so the `sptr` crate is used. This crate provides the extension
-        // trait `Strict` but the method names conflict with the nightly methods
-        // so a different syntax is used to invoke methods here.
         let addr = &raw const self.vmctx;
-        let ret = Strict::with_addr(self.vmctx_self_reference.as_ptr(), Strict::addr(addr));
+        let ret = self.vmctx_self_reference.as_ptr().with_addr(addr.addr());
         NonNull::new(ret).unwrap()
     }
 
@@ -1503,6 +1505,11 @@ impl Instance {
             }
         }
         fault
+    }
+
+    /// Returns the id, within this instance's store, that it's assigned.
+    pub fn id(&self) -> InstanceId {
+        self.id
     }
 }
 
