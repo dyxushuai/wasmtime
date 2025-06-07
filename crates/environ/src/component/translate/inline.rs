@@ -134,7 +134,6 @@ pub(super) fn run(
         inliner.record_export(name, def, types, &mut export_map)?;
     }
     inliner.result.exports = export_map;
-    inliner.result.num_resource_tables = types.num_resource_tables();
     inliner.result.num_future_tables = types.num_future_tables();
     inliner.result.num_stream_tables = types.num_stream_tables();
     inliner.result.num_error_context_tables = types.num_error_context_tables();
@@ -698,6 +697,15 @@ impl<'a> Inliner<'a> {
                     .push((*func, dfg::Trampoline::TaskReturn { results, options }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
+            TaskCancel { func } => {
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::TaskCancel {
+                        instance: frame.instance,
+                    },
+                ));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
             WaitableSetNew { func } => {
                 let index = self.result.trampolines.push((
                     *func,
@@ -771,6 +779,16 @@ impl<'a> Inliner<'a> {
                     *func,
                     dfg::Trampoline::SubtaskDrop {
                         instance: frame.instance,
+                    },
+                ));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            SubtaskCancel { func, async_ } => {
+                let index = self.result.trampolines.push((
+                    *func,
+                    dfg::Trampoline::SubtaskCancel {
+                        instance: frame.instance,
+                        async_: *async_,
                     },
                 ));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
@@ -989,6 +1007,20 @@ impl<'a> Inliner<'a> {
                     .result
                     .trampolines
                     .push((*func, dfg::Trampoline::ErrorContextDrop { ty }));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            ContextGet { func, i } => {
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::ContextGet(*i)));
+                frame.funcs.push(dfg::CoreDef::Trampoline(index));
+            }
+            ContextSet { func, i } => {
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::ContextSet(*i)));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
 
@@ -1405,7 +1437,9 @@ impl<'a> Inliner<'a> {
                 // somewhat tricky and needs something like temporary scratch
                 // space that isn't implemented.
                 ComponentFuncDef::Import(_) => {
-                    bail!("component export `{name}` is a reexport of an imported function which is not implemented")
+                    bail!(
+                        "component export `{name}` is a reexport of an imported function which is not implemented"
+                    )
                 }
             },
 

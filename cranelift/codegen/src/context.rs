@@ -24,8 +24,8 @@ use crate::result::{CodegenResult, CompileResult};
 use crate::settings::{FlagsOrIsa, OptLevel};
 use crate::trace;
 use crate::unreachable_code::eliminate_unreachable_code;
-use crate::verifier::{verify_context, VerifierErrors, VerifierResult};
-use crate::{timing, CompileError};
+use crate::verifier::{VerifierErrors, VerifierResult, verify_context};
+use crate::{CompileError, timing};
 #[cfg(feature = "souper-harvest")]
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -115,7 +115,7 @@ impl Context {
         isa: &dyn TargetIsa,
         mem: &mut Vec<u8>,
         ctrl_plane: &mut ControlPlane,
-    ) -> CompileResult<&CompiledCode> {
+    ) -> CompileResult<'_, &CompiledCode> {
         let compiled_code = self.compile(isa, ctrl_plane)?;
         mem.extend_from_slice(compiled_code.code_buffer());
         Ok(compiled_code)
@@ -204,7 +204,7 @@ impl Context {
         &mut self,
         isa: &dyn TargetIsa,
         ctrl_plane: &mut ControlPlane,
-    ) -> CompileResult<&CompiledCode> {
+    ) -> CompileResult<'_, &CompiledCode> {
         let stencil = self
             .compile_stencil(isa, ctrl_plane)
             .map_err(|error| CompileError {

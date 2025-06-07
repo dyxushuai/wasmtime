@@ -209,7 +209,6 @@ fn test_trap_through_host() -> Result<()> {
 }
 
 #[test]
-#[allow(deprecated)]
 fn test_trap_backtrace_disabled() -> Result<()> {
     let mut config = Config::default();
     config.wasm_backtrace(false);
@@ -736,7 +735,7 @@ fn parse_dwarf_info() -> Result<()> {
     let module = Module::new(&engine, &wasm)?;
     let mut linker = Linker::new(&engine);
     wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |t| t)?;
-    let mut store = Store::new(&engine, wasmtime_wasi::WasiCtxBuilder::new().build_p1());
+    let mut store = Store::new(&engine, wasmtime_wasi::p2::WasiCtxBuilder::new().build_p1());
     linker.module(&mut store, "", &module)?;
     let run = linker.get_default(&mut store, "")?;
     let trap = run.call(&mut store, &[], &mut []).unwrap_err();
@@ -827,17 +826,21 @@ fn multithreaded_traps() -> Result<()> {
     )?;
     let instance = Instance::new(&mut store, &module, &[])?;
 
-    assert!(instance
-        .get_typed_func::<(), ()>(&mut store, "run")?
-        .call(&mut store, ())
-        .is_err());
+    assert!(
+        instance
+            .get_typed_func::<(), ()>(&mut store, "run")?
+            .call(&mut store, ())
+            .is_err()
+    );
 
     let handle = std::thread::spawn(move || {
-        assert!(instance
-            .get_typed_func::<(), ()>(&mut store, "run")
-            .unwrap()
-            .call(&mut store, ())
-            .is_err());
+        assert!(
+            instance
+                .get_typed_func::<(), ()>(&mut store, "run")
+                .unwrap()
+                .call(&mut store, ())
+                .is_err()
+        );
     });
 
     handle.join().expect("couldn't join thread");
@@ -1147,7 +1150,6 @@ fn standalone_backtrace() -> Result<()> {
 }
 
 #[test]
-#[allow(deprecated)]
 fn standalone_backtrace_disabled() -> Result<()> {
     let mut config = Config::new();
     config.wasm_backtrace(false);

@@ -3,11 +3,11 @@ use crate::function_generator::FunctionGenerator;
 use crate::settings::{Flags, OptLevel};
 use anyhow::Result;
 use arbitrary::{Arbitrary, Unstructured};
+use cranelift::codegen::Context;
 use cranelift::codegen::data_value::DataValue;
 use cranelift::codegen::ir::{Function, LibCall};
 use cranelift::codegen::ir::{UserExternalName, UserFuncName};
 use cranelift::codegen::isa::Builder;
-use cranelift::codegen::Context;
 use cranelift::prelude::isa::{OwnedTargetIsa, TargetIsa};
 use cranelift::prelude::settings::SettingKind;
 use cranelift::prelude::*;
@@ -253,6 +253,10 @@ where
         // `machine_code_cfg_info` generates additional metadata for the embedder but this doesn't feed back
         // into compilation anywhere, we leave it on unconditionally to make sure the generation doesn't panic.
         builder.enable("machine_code_cfg_info")?;
+
+        // Differential fuzzing between the interpreter and the host will only
+        // really work if NaN payloads are canonicalized, so enable this.
+        builder.enable("cranelift_nan_canonicalization")?;
 
         Ok(Flags::new(builder))
     }

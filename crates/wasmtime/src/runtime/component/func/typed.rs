@@ -1,9 +1,8 @@
+use crate::component::Instance;
 use crate::component::func::{Func, LiftContext, LowerContext, Options};
 use crate::component::matching::InstanceType;
 use crate::component::storage::{storage_as_slice, storage_as_slice_mut};
 use crate::prelude::*;
-use crate::runtime::vm::component::ComponentInstance;
-use crate::runtime::vm::SendSyncPtr;
 use crate::{AsContextMut, StoreContext, StoreContextMut, ValRaw};
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
@@ -11,11 +10,10 @@ use core::fmt;
 use core::iter;
 use core::marker;
 use core::mem::{self, MaybeUninit};
-use core::ptr::NonNull;
 use core::str;
 use wasmtime_environ::component::{
-    CanonicalAbiInfo, ComponentTypes, InterfaceType, StringEncoding, VariantInfo, MAX_FLAT_PARAMS,
-    MAX_FLAT_RESULTS,
+    CanonicalAbiInfo, ComponentTypes, InterfaceType, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS,
+    StringEncoding, VariantInfo,
 };
 
 #[cfg(feature = "component-model-async")]
@@ -174,13 +172,12 @@ where
     /// only works with functions defined within an asynchronous store. Also
     /// panics if `store` does not own this function.
     #[cfg(feature = "async")]
-    pub async fn call_async<T>(
+    pub async fn call_async(
         &self,
-        mut store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data: Send>,
         params: Params,
     ) -> Result<Return>
     where
-        T: Send,
         Params: Send + Sync,
         Return: Send + Sync,
     {
@@ -201,9 +198,9 @@ where
     /// made using this method may run concurrently with other calls to the same
     /// instance.
     #[cfg(feature = "component-model-async")]
-    pub async fn call_concurrent<T: Send>(
+    pub async fn call_concurrent(
         self,
-        mut store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data: Send>,
         params: Params,
     ) -> Result<Promise<Return>>
     where
@@ -1383,7 +1380,10 @@ impl WasmStr {
     // in an opt-in basis don't do validation. Additionally there should be some
     // method that returns `[u16]` after validating to avoid the utf16-to-utf8
     // transcode.
-    pub fn to_str<'a, T: 'a>(&self, store: impl Into<StoreContext<'a, T>>) -> Result<Cow<'a, str>> {
+    pub fn to_str<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContext<'a, T>>,
+    ) -> Result<Cow<'a, str>> {
         let store = store.into().0;
         let memory = self.options.memory(store);
         self.to_str_from_memory(memory)
@@ -1582,7 +1582,7 @@ pub struct WasmList<T> {
     // reference to something inside a `StoreOpaque`, but that's not easily
     // available at this time, so it's left as a future exercise.
     types: Arc<ComponentTypes>,
-    instance: SendSyncPtr<ComponentInstance>,
+    instance: Instance,
     _marker: marker::PhantomData<T>,
 }
 
@@ -1609,7 +1609,7 @@ impl<T: Lift> WasmList<T> {
             options: *cx.options,
             elem,
             types: cx.types.clone(),
-            instance: SendSyncPtr::new(NonNull::new(cx.instance_ptr()).unwrap()),
+            instance: cx.instance_handle(),
             _marker: marker::PhantomData,
         })
     }
@@ -1637,14 +1637,7 @@ impl<T: Lift> WasmList<T> {
     pub fn get(&self, mut store: impl AsContextMut, index: usize) -> Option<Result<T>> {
         let store = store.as_context_mut().0;
         self.options.store_id().assert_belongs_to(store.id());
-        // This should be safe because the unsafety lies in the `self.instance`
-        // pointer passed in has previously been validated by the lifting
-        // context this was originally created within and with the check above
-        // this is guaranteed to be the same store. This means that this should
-        // be carrying over the original assertion from the original creation of
-        // the lifting context that created this type.
-        let mut cx =
-            unsafe { LiftContext::new(store, &self.options, &self.types, self.instance.as_ptr()) };
+        let mut cx = LiftContext::new(store, &self.options, &self.types, self.instance);
         self.get_from_store(&mut cx, index)
     }
 
@@ -1666,15 +1659,13 @@ impl<T: Lift> WasmList<T> {
     ///
     /// Each item of the list may fail to decode and is represented through the
     /// `Result` value of the iterator.
-    pub fn iter<'a, U: 'a>(
+    pub fn iter<'a, U: 'static>(
         &'a self,
         store: impl Into<StoreContextMut<'a, U>>,
     ) -> impl ExactSizeIterator<Item = Result<T>> + 'a {
         let store = store.into().0;
         self.options.store_id().assert_belongs_to(store.id());
-        // See comments about unsafety in the `get` method.
-        let mut cx =
-            unsafe { LiftContext::new(store, &self.options, &self.types, self.instance.as_ptr()) };
+        let mut cx = LiftContext::new(store, &self.options, &self.types, self.instance);
         (0..self.len).map(move |i| self.get_from_store(&mut cx, i).unwrap())
     }
 }
@@ -1699,7 +1690,7 @@ macro_rules! raw_wasm_list_accessors {
             ///
             /// Panics if the `store` provided is not the one from which this
             /// slice originated.
-            pub fn as_le_slice<'a, T: 'a>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a [$i] {
+            pub fn as_le_slice<'a, T: 'static>(&self, store: impl Into<StoreContext<'a, T>>) -> &'a [$i] {
                 let memory = self.options.memory(store.into().0);
                 self._as_le_slice(memory)
             }

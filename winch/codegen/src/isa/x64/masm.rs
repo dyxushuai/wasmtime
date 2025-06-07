@@ -4,43 +4,45 @@ use super::{
     asm::{Assembler, PatchableAddToReg, VcmpKind, VcvtKind, VroundMode},
     regs::{self, rbp, rsp},
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 use crate::masm::{
     DivKind, Extend, ExtendKind, ExtractLaneKind, FloatCmpKind, Imm as I, IntCmpKind, LaneSelector,
     LoadKind, MacroAssembler as Masm, MulWideKind, OperandSize, RegImm, RemKind, ReplaceLaneKind,
-    RmwOp, RoundingMode, ShiftKind, SplatKind, StoreKind, TrapCode, TruncKind, V128AbsKind,
-    V128AddKind, V128ConvertKind, V128ExtAddKind, V128ExtMulKind, V128ExtendKind, V128MaxKind,
-    V128MinKind, V128MulKind, V128NarrowKind, V128NegKind, V128SubKind, V128TruncKind,
-    VectorCompareKind, VectorEqualityKind, Zero, TRUSTED_FLAGS, UNTRUSTED_FLAGS,
+    RmwOp, RoundingMode, ShiftKind, SplatKind, StoreKind, TRUSTED_FLAGS, TrapCode, TruncKind,
+    UNTRUSTED_FLAGS, V128AbsKind, V128AddKind, V128ConvertKind, V128ExtAddKind, V128ExtMulKind,
+    V128ExtendKind, V128MaxKind, V128MinKind, V128MulKind, V128NarrowKind, V128NegKind,
+    V128SubKind, V128TruncKind, VectorCompareKind, VectorEqualityKind, Zero,
 };
 use crate::{
-    abi::{self, align_to, calculate_frame_adjustment, LocalSlot},
-    codegen::{ptr_type_from_ptr_size, CodeGenContext, CodeGenError, Emission, FuncEnv},
+    abi::{self, LocalSlot, align_to, calculate_frame_adjustment},
+    codegen::{CodeGenContext, CodeGenError, Emission, FuncEnv, ptr_type_from_ptr_size},
     stack::{TypedReg, Val},
 };
 use crate::{
-    abi::{vmctx, ABI},
+    abi::{ABI, vmctx},
     masm::{SPOffset, StackSlot},
 };
 use crate::{
     isa::{
-        reg::{writable, Reg, RegClass, WritableReg},
         CallingConvention,
+        reg::{Reg, RegClass, WritableReg, writable},
     },
     masm::CalleeKind,
 };
 use cranelift_codegen::{
+    Final, MachBufferFinalized, MachLabel,
     binemit::CodeOffset,
     ir::{MemFlags, RelSourceLoc, SourceLoc},
     isa::{
         unwind::UnwindInst,
         x64::{
-            args::{Avx512Opcode, AvxOpcode, FenceKind, CC},
-            settings as x64_settings, AtomicRmwSeqOp,
+            AtomicRmwSeqOp,
+            args::{Avx512Opcode, AvxOpcode, CC, FenceKind},
+            settings as x64_settings,
         },
     },
-    settings, Final, MachBufferFinalized, MachLabel,
+    settings,
 };
 use wasmtime_cranelift::TRAP_UNREACHABLE;
 use wasmtime_environ::{PtrSize, WasmValType};
@@ -319,7 +321,6 @@ impl Masm for MacroAssembler {
         match callee {
             CalleeKind::Indirect(reg) => self.asm.call_with_reg(cc, reg),
             CalleeKind::Direct(idx) => self.asm.call_with_name(cc, idx),
-            CalleeKind::LibCall(lib) => self.asm.call_with_lib(cc, lib, regs::scratch()),
         };
         Ok(total_stack)
     }
@@ -421,25 +422,7 @@ impl Masm for MacroAssembler {
                 (RegClass::Float, RegClass::Float) => Ok(self.asm.xmm_mov_rr(src, dst, size)),
                 _ => bail!(CodeGenError::invalid_operand_combination()),
             },
-            (RegImm::Imm(imm), _) => match imm {
-                I::I32(v) => Ok(self.asm.mov_ir(v as u64, dst, size)),
-                I::I64(v) => Ok(self.asm.mov_ir(v, dst, size)),
-                I::F32(v) => {
-                    let addr = self.asm.add_constant(v.to_le_bytes().as_slice());
-                    self.asm.xmm_mov_mr(&addr, dst, size, TRUSTED_FLAGS);
-                    Ok(())
-                }
-                I::F64(v) => {
-                    let addr = self.asm.add_constant(v.to_le_bytes().as_slice());
-                    self.asm.xmm_mov_mr(&addr, dst, size, TRUSTED_FLAGS);
-                    Ok(())
-                }
-                I::V128(v) => {
-                    let addr = self.asm.add_constant(v.to_le_bytes().as_slice());
-                    self.asm.xmm_mov_mr(&addr, dst, size, TRUSTED_FLAGS);
-                    Ok(())
-                }
-            },
+            (RegImm::Imm(imm), _) => self.load_constant(&imm, dst, size),
         }
     }
 
@@ -927,8 +910,8 @@ impl Masm for MacroAssembler {
             // Use the following approach:
             // dst = size.num_bits() - bsr(src) - is_not_zero
             //     = size.num.bits() + -bsr(src) - is_not_zero.
-            self.asm.bsr(src.into(), dst, size);
-            self.asm.setcc(IntCmpKind::Ne, writable!(scratch.into()));
+            self.asm.bsr(src, dst, size);
+            self.asm.setcc(IntCmpKind::Ne, writable!(scratch));
             self.asm.neg(dst.to_reg(), dst, size);
             self.asm.add_ir(size.num_bits() as i32, dst, size);
             self.asm.sub_rr(scratch, dst, size);
@@ -949,8 +932,8 @@ impl Masm for MacroAssembler {
             // BSF outputs the correct value for every value except 0.
             // When the value is 0, BSF outputs 0, correct output for ctz is
             // the number of bits.
-            self.asm.bsf(src.into(), dst.into(), size);
-            self.asm.setcc(IntCmpKind::Eq, writable!(scratch.into()));
+            self.asm.bsf(src, dst, size);
+            self.asm.setcc(IntCmpKind::Eq, writable!(scratch));
             self.asm
                 .shift_ir(size.log2(), writable!(scratch), ShiftKind::Shl, size);
             self.asm.add_rr(scratch, dst, size);
@@ -1005,7 +988,7 @@ impl Masm for MacroAssembler {
     fn popcnt(&mut self, context: &mut CodeGenContext<Emission>, size: OperandSize) -> Result<()> {
         let src = context.pop_to_reg(self, None)?;
         if self.flags.has_popcnt() && self.flags.has_sse42() {
-            self.asm.popcnt(src.into(), size);
+            self.asm.popcnt(src.into(), writable!(src.into()), size);
             context.stack.push(src.into());
             Ok(())
         } else {
@@ -1052,8 +1035,8 @@ impl Masm for MacroAssembler {
             self.asm.add_rr(dst.to_reg(), tmp, size);
 
             // x = (x + (x >> 4)) & m4;
-            self.asm.mov_rr(tmp.to_reg(), dst.into(), size);
-            self.asm.shift_ir(4u8, dst.into(), ShiftKind::ShrU, size);
+            self.asm.mov_rr(tmp.to_reg(), dst, size);
+            self.asm.shift_ir(4u8, dst, ShiftKind::ShrU, size);
             self.asm.add_rr(tmp.to_reg(), dst, size);
             let lhs = dst.to_reg();
             self.and(writable!(lhs), lhs, RegImm::i64(masks[2]), size)?;
@@ -1061,8 +1044,7 @@ impl Masm for MacroAssembler {
             // (x * h01) >> shift_amt
             let lhs = dst.to_reg();
             self.mul(writable!(lhs), lhs, RegImm::i64(masks[3]), size)?;
-            self.asm
-                .shift_ir(shift_amt, dst.into(), ShiftKind::ShrU, size);
+            self.asm.shift_ir(shift_amt, dst, ShiftKind::ShrU, size);
 
             context.stack.push(src.into());
             context.free_reg(tmp.to_reg());
@@ -1072,7 +1054,7 @@ impl Masm for MacroAssembler {
     }
 
     fn wrap(&mut self, dst: WritableReg, src: Reg) -> Result<()> {
-        self.asm.mov_rr(src.into(), dst, OperandSize::S32);
+        self.asm.mov_rr(src, dst, OperandSize::S32);
         Ok(())
     }
 
@@ -1192,19 +1174,19 @@ impl Masm for MacroAssembler {
         src: Reg,
         size: OperandSize,
     ) -> Result<()> {
-        self.asm.gpr_to_xmm(src.into(), dst, size);
+        self.asm.gpr_to_xmm(src, dst, size);
         Ok(())
     }
 
     fn demote(&mut self, dst: WritableReg, src: Reg) -> Result<()> {
         self.asm
-            .cvt_float_to_float(src.into(), dst.into(), OperandSize::S64, OperandSize::S32);
+            .cvt_float_to_float(src, dst, OperandSize::S64, OperandSize::S32);
         Ok(())
     }
 
     fn promote(&mut self, dst: WritableReg, src: Reg) -> Result<()> {
         self.asm
-            .cvt_float_to_float(src.into(), dst, OperandSize::S32, OperandSize::S64);
+            .cvt_float_to_float(src, dst, OperandSize::S32, OperandSize::S64);
         Ok(())
     }
 
@@ -1501,7 +1483,7 @@ impl Masm for MacroAssembler {
             Some(ext) => {
                 // We don't need to zero-extend from 32 to 64bits.
                 if !(ext.from_bits() == 32 && ext.to_bits() == 64) {
-                    self.asm.movzx_rr(res, writable!(res), ext.into());
+                    self.asm.movzx_rr(res, writable!(res), ext);
                 }
 
                 WasmValType::int_from_bits(ext.to_bits())
@@ -1656,7 +1638,7 @@ impl Masm for MacroAssembler {
             // We don't need to zero-extend from 32 to 64bits.
             if !(extend.from_bits() == 32 && extend.to_bits() == 64) {
                 self.asm
-                    .movzx_rr(expected.reg.into(), writable!(expected.reg.into()), extend);
+                    .movzx_rr(expected.reg, writable!(expected.reg), extend);
             }
         }
 
@@ -2548,7 +2530,9 @@ impl Masm for MacroAssembler {
                 self.asm
                     .shift_ir(0x8, dst, ShiftKind::ShrU, OperandSize::S32);
             }
-            OperandSize::S32 | OperandSize::S64 => self.asm.xmm_vmovskp_rr(src, dst, size, size),
+            OperandSize::S32 | OperandSize::S64 => {
+                self.asm.xmm_vmovskp_rr(src, dst, size, OperandSize::S32)
+            }
             _ => unimplemented!(),
         }
 
@@ -2947,7 +2931,7 @@ impl MacroAssembler {
         shared_flags: settings::Flags,
         isa_flags: x64_settings::Flags,
     ) -> Result<Self> {
-        let ptr_type: WasmValType = ptr_type_from_ptr_size(ptr_size.size()).into();
+        let ptr_type: WasmValType = ptr_type_from_ptr_size(ptr_size.size());
 
         Ok(Self {
             sp_offset: 0,
@@ -3018,7 +3002,9 @@ impl MacroAssembler {
         match constant {
             I::I32(v) => Ok(self.asm.mov_ir(*v as u64, dst, size)),
             I::I64(v) => Ok(self.asm.mov_ir(*v, dst, size)),
-            _ => Err(anyhow!(CodeGenError::unsupported_imm())),
+            I::F32(_) => Ok(self.asm.load_fp_const(dst, &constant.to_bytes(), size)),
+            I::F64(_) => Ok(self.asm.load_fp_const(dst, &constant.to_bytes(), size)),
+            I::V128(_) => Ok(self.asm.load_fp_const(dst, &constant.to_bytes(), size)),
         }
     }
 

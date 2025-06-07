@@ -1,14 +1,14 @@
-use crate::abi::{self, align_to, scratch, LocalSlot};
+use crate::abi::{self, LocalSlot, align_to, scratch};
 use crate::codegen::{CodeGenContext, Emission, FuncEnv};
 use crate::isa::{
-    reg::{writable, Reg, WritableReg},
     CallingConvention,
+    reg::{Reg, WritableReg, writable},
 };
 use anyhow::Result;
 use cranelift_codegen::{
-    binemit::CodeOffset,
-    ir::{Endianness, LibCall, MemFlags, RelSourceLoc, SourceLoc, UserExternalNameRef},
     Final, MachBufferFinalized, MachLabel,
+    binemit::CodeOffset,
+    ir::{Endianness, MemFlags, RelSourceLoc, SourceLoc, UserExternalNameRef},
 };
 use std::{fmt::Debug, ops::Range};
 use wasmtime_environ::PtrSize;
@@ -21,6 +21,13 @@ pub(crate) enum DivKind {
     Signed,
     /// Unsigned division.
     Unsigned,
+}
+
+/// Represents the `memory.atomic.wait*` kind.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AtomicWaitKind {
+    Wait32,
+    Wait64,
 }
 
 /// Remainder kind.
@@ -1175,10 +1182,6 @@ pub(crate) const MAX_CONTEXT_ARGS: usize = 2;
 /// [FnCall::emit].
 #[derive(Clone, Debug)]
 pub(crate) enum ContextArgs {
-    /// No context arguments required. This is used for libcalls that don't
-    /// require any special context arguments. For example builtin functions
-    /// that perform float calculations.
-    None,
     /// A single context argument is required; the current pinned [VMcontext]
     /// register must be passed as the first argument of the function call.
     VMContext([VMContextLoc; 1]),
@@ -1189,11 +1192,6 @@ pub(crate) enum ContextArgs {
 }
 
 impl ContextArgs {
-    /// Construct an empty [ContextArgs].
-    pub fn none() -> Self {
-        Self::None
-    }
-
     /// Construct a [ContextArgs] declaring the usage of the pinned [VMContext]
     /// register as both the caller and callee context arguments.
     pub fn pinned_callee_and_caller_vmctx() -> Self {
@@ -1220,7 +1218,6 @@ impl ContextArgs {
     /// Get a slice of the context arguments.
     pub fn as_slice(&self) -> &[VMContextLoc] {
         match self {
-            Self::None => &[],
             Self::VMContext(a) => a.as_slice(),
             Self::CalleeAndCallerVMContext(a) => a.as_slice(),
         }
@@ -1233,8 +1230,6 @@ pub(crate) enum CalleeKind {
     Indirect(Reg),
     /// A function call to a local function.
     Direct(UserExternalNameRef),
-    /// Call to a well known LibCall.
-    LibCall(LibCall),
 }
 
 impl CalleeKind {
@@ -1246,11 +1241,6 @@ impl CalleeKind {
     /// Creates a direct callee kind from a function name.
     pub fn direct(name: UserExternalNameRef) -> Self {
         Self::Direct(name)
-    }
-
-    /// Creates a known callee kind from a libcall.
-    pub fn libcall(call: LibCall) -> Self {
-        Self::LibCall(call)
     }
 }
 
@@ -1450,7 +1440,7 @@ pub(crate) trait MacroAssembler {
 
     /// Perform a conditional move.
     fn cmov(&mut self, dst: WritableReg, src: Reg, cc: IntCmpKind, size: OperandSize)
-        -> Result<()>;
+    -> Result<()>;
 
     /// Performs a memory move of bytes from src to dest.
     /// Bytes are moved in blocks of 8 bytes, where possible.
@@ -1488,10 +1478,7 @@ pub(crate) trait MacroAssembler {
                         self.address_from_sp(SPOffset::from_u32(src_offs))?,
                         writable!(scratch),
                     )?;
-                    self.store_ptr(
-                        scratch.into(),
-                        self.address_from_sp(SPOffset::from_u32(dst_offs))?,
-                    )?;
+                    self.store_ptr(scratch, self.address_from_sp(SPOffset::from_u32(dst_offs))?)?;
                 }
             }
             MemMoveDirection::HighToLow => {
@@ -1503,10 +1490,7 @@ pub(crate) trait MacroAssembler {
                         self.address_from_sp(SPOffset::from_u32(src_offs))?,
                         writable!(scratch),
                     )?;
-                    self.store_ptr(
-                        scratch.into(),
-                        self.address_from_sp(SPOffset::from_u32(dst_offs))?,
-                    )?;
+                    self.store_ptr(scratch, self.address_from_sp(SPOffset::from_u32(dst_offs))?)?;
 
                     remaining -= word_bytes;
                     src_offs -= word_bytes;
@@ -1840,7 +1824,7 @@ pub(crate) trait MacroAssembler {
             self.zero(writable!(zero))?;
             let zero = RegImm::reg(zero);
 
-            for step in (start..end).into_iter().step_by(word_size as usize) {
+            for step in (start..end).step_by(word_size as usize) {
                 let slot = LocalSlot::i64(step + word_size);
                 let addr: Self::Address = self.local_address(&slot)?;
                 self.store(zero, addr, OperandSize::S64)?;
@@ -1943,7 +1927,7 @@ pub(crate) trait MacroAssembler {
     /// Note that some platforms require special handling of registers in this
     /// instruction (e.g. x64) so full access to `CodeGenContext` is provided.
     fn mul_wide(&mut self, context: &mut CodeGenContext<Emission>, kind: MulWideKind)
-        -> Result<()>;
+    -> Result<()>;
 
     /// Takes the value in a src operand and replicates it across lanes of
     /// `size` in a destination result.
@@ -2130,7 +2114,7 @@ pub(crate) trait MacroAssembler {
 
     /// Perform a vector lane-wise mul between `lhs` and `rhs`, placing the result in `dst`.
     fn v128_mul(&mut self, context: &mut CodeGenContext<Emission>, kind: V128MulKind)
-        -> Result<()>;
+    -> Result<()>;
 
     /// Perform an absolute operation on a vector.
     fn v128_abs(&mut self, src: Reg, dst: WritableReg, kind: V128AbsKind) -> Result<()>;
@@ -2183,11 +2167,11 @@ pub(crate) trait MacroAssembler {
 
     /// Perform a lane-wise `min` operation between `src1` and `src2`.
     fn v128_min(&mut self, src1: Reg, src2: Reg, dst: WritableReg, kind: V128MinKind)
-        -> Result<()>;
+    -> Result<()>;
 
     /// Perform a lane-wise `max` operation between `src1` and `src2`.
     fn v128_max(&mut self, src1: Reg, src2: Reg, dst: WritableReg, kind: V128MaxKind)
-        -> Result<()>;
+    -> Result<()>;
 
     /// Perform the lane-wise integer extended multiplication producing twice wider result than the
     /// inputs. This is equivalent to an extend followed by a multiply.

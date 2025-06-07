@@ -1,11 +1,11 @@
 use {
     crate::{
-        store::StoreInner,
-        vm::{component::ComponentInstance, VMFuncRef, VMMemoryDefinition},
         AsContextMut, ValRaw,
+        store::StoreInner,
+        vm::{VMFuncRef, VMMemoryDefinition, component::ComponentInstance},
     },
     anyhow::Result,
-    futures::{stream::FuturesUnordered, FutureExt},
+    futures::{FutureExt, stream::FuturesUnordered},
     std::{boxed::Box, future::Future, mem::MaybeUninit, pin::Pin},
     wasmtime_environ::component::{
         RuntimeComponentInstanceIndex, TypeComponentLocalErrorContextTableIndex,
@@ -13,6 +13,7 @@ use {
     },
 };
 
+pub(crate) use futures_and_streams::ResourcePair;
 pub use futures_and_streams::{ErrorContext, FutureReader, StreamReader};
 
 mod futures_and_streams;
