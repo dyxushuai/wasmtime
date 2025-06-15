@@ -8,13 +8,13 @@ block0(v0: i8, v1: i8):
 }
 
 ; VCode:
-;   pushq   %rbp
-;   movq    %rsp, %rbp
+;   pushq %rbp
+;   movq %rsp, %rbp
 ; block0:
-;   movzbl  %dil, %eax
-;   div     %al, %sil, %al ; trap=int_divz
-;   movq    %rbp, %rsp
-;   popq    %rbp
+;   movzbl %dil, %eax
+;   divb %sil ;; implicit: %ax, trap=254
+;   movq %rbp, %rsp
+;   popq %rbp
 ;   ret
 ;
 ; Disassembled:
@@ -35,14 +35,15 @@ block0(v0: i16, v1: i16):
 }
 
 ; VCode:
-;   pushq   %rbp
-;   movq    %rsp, %rbp
+;   pushq %rbp
+;   movq %rsp, %rbp
 ; block0:
-;   xorq    %rdx, %rdx, %rdx
-;   movq    %rdi, %rax
-;   div     %ax, %dx, %si, %ax, %dx ; trap=int_divz
-;   movq    %rbp, %rsp
-;   popq    %rbp
+;   uninit  %rdx
+;   xorq %rdx, %rdx
+;   movq %rdi, %rax
+;   divw %si ;; implicit: %ax, %dx, trap=254
+;   movq %rbp, %rsp
+;   popq %rbp
 ;   ret
 ;
 ; Disassembled:
@@ -64,14 +65,15 @@ block0(v0: i32, v1: i32):
 }
 
 ; VCode:
-;   pushq   %rbp
-;   movq    %rsp, %rbp
+;   pushq %rbp
+;   movq %rsp, %rbp
 ; block0:
-;   xorq    %rdx, %rdx, %rdx
-;   movq    %rdi, %rax
-;   div     %eax, %edx, %esi, %eax, %edx ; trap=int_divz
-;   movq    %rbp, %rsp
-;   popq    %rbp
+;   uninit  %rdx
+;   xorq %rdx, %rdx
+;   movq %rdi, %rax
+;   divl %esi ;; implicit: %eax, %edx, trap=254
+;   movq %rbp, %rsp
+;   popq %rbp
 ;   ret
 ;
 ; Disassembled:
@@ -93,14 +95,15 @@ block0(v0: i64, v1: i64):
 }
 
 ; VCode:
-;   pushq   %rbp
-;   movq    %rsp, %rbp
+;   pushq %rbp
+;   movq %rsp, %rbp
 ; block0:
-;   xorq    %rdx, %rdx, %rdx
-;   movq    %rdi, %rax
-;   div     %rax, %rdx, %rsi, %rax, %rdx ; trap=int_divz
-;   movq    %rbp, %rsp
-;   popq    %rbp
+;   uninit  %rdx
+;   xorq %rdx, %rdx
+;   movq %rdi, %rax
+;   divq %rsi ;; implicit: %rax, %rdx, trap=254
+;   movq %rbp, %rsp
+;   popq %rbp
 ;   ret
 ;
 ; Disassembled:

@@ -4,19 +4,19 @@
 //! You probably want to use [`preview1`](crate::preview1) instead.
 
 use crate::preview0::types::Error;
+use crate::preview1::WasiP1Ctx;
 use crate::preview1::types as snapshot1_types;
 use crate::preview1::wasi_snapshot_preview1::WasiSnapshotPreview1 as Snapshot1;
-use crate::preview1::WasiP1Ctx;
 use wiggle::{GuestError, GuestMemory, GuestPtr};
 
-pub fn add_to_linker_async<T: Send>(
+pub fn add_to_linker_async<T: Send + 'static>(
     linker: &mut wasmtime::Linker<T>,
     f: impl Fn(&mut T) -> &mut WasiP1Ctx + Copy + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
     wasi_unstable::add_to_linker(linker, f)
 }
 
-pub fn add_to_linker_sync<T: Send>(
+pub fn add_to_linker_sync<T: Send + 'static>(
     linker: &mut wasmtime::Linker<T>,
     f: impl Fn(&mut T) -> &mut WasiP1Ctx + Copy + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
@@ -24,7 +24,7 @@ pub fn add_to_linker_sync<T: Send>(
 }
 
 wiggle::from_witx!({
-    witx: ["$CARGO_MANIFEST_DIR/witx/preview0/wasi_unstable.witx"],
+    witx: ["witx/preview0/wasi_unstable.witx"],
     async: {
         wasi_unstable::{
             fd_advise, fd_close, fd_datasync, fd_fdstat_get, fd_filestat_get, fd_filestat_set_size,
@@ -42,7 +42,7 @@ mod sync {
     use std::future::Future;
 
     wiggle::wasmtime_integration!({
-        witx: ["$CARGO_MANIFEST_DIR/witx/preview0/wasi_unstable.witx"],
+        witx: ["witx/preview0/wasi_unstable.witx"],
         target: super,
         block_on[in_tokio]: {
             wasi_unstable::{
@@ -870,14 +870,14 @@ convert_struct!(
 impl From<snapshot1_types::Filestat> for types::Filestat {
     fn from(f: snapshot1_types::Filestat) -> types::Filestat {
         types::Filestat {
-            dev: f.dev.into(),
-            ino: f.ino.into(),
+            dev: f.dev,
+            ino: f.ino,
             filetype: f.filetype.into(),
             nlink: f.nlink.try_into().unwrap_or(u32::MAX),
-            size: f.size.into(),
-            atim: f.atim.into(),
-            mtim: f.mtim.into(),
-            ctim: f.ctim.into(),
+            size: f.size,
+            atim: f.atim,
+            mtim: f.mtim,
+            ctim: f.ctim,
         }
     }
 }
