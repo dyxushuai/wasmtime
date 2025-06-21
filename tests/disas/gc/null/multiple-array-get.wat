@@ -22,8 +22,8 @@
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32, v4: i32):
 ;; @0024                               trapz v2, user16
-;; @0024                               v57 = load.i64 notrap aligned readonly can_move v0+8
-;; @0024                               v8 = load.i64 notrap aligned readonly can_move v57+24
+;; @0024                               v65 = load.i64 notrap aligned readonly can_move v0+8
+;; @0024                               v8 = load.i64 notrap aligned readonly can_move v65+24
 ;; @0024                               v7 = uextend.i64 v2
 ;; @0024                               v9 = iadd v8, v7
 ;; @0024                               v10 = iconst.i64 8
@@ -34,8 +34,8 @@
 ;; @0024                               v15 = uextend.i64 v12
 ;;                                     v67 = iconst.i64 3
 ;;                                     v68 = ishl v15, v67  ; v67 = 3
-;;                                     v59 = iconst.i64 32
-;; @0024                               v17 = ushr v68, v59  ; v59 = 32
+;;                                     v64 = iconst.i64 32
+;; @0024                               v17 = ushr v68, v64  ; v64 = 32
 ;; @0024                               trapnz v17, user1
 ;;                                     v77 = iconst.i32 3
 ;;                                     v78 = ishl v12, v77  ; v77 = 3
@@ -44,16 +44,16 @@
 ;; @0024                               v24 = uadd_overflow_trap v2, v20, user1
 ;; @0024                               v25 = uextend.i64 v24
 ;; @0024                               v27 = iadd v8, v25
-;;                                     v85 = ishl v3, v77  ; v77 = 3
-;; @0024                               v23 = iadd v85, v19  ; v19 = 16
+;;                                     v84 = ishl v3, v77  ; v77 = 3
+;; @0024                               v23 = iadd v84, v19  ; v19 = 16
 ;; @0024                               v28 = isub v20, v23
 ;; @0024                               v29 = uextend.i64 v28
 ;; @0024                               v30 = isub v27, v29
 ;; @0024                               v31 = load.i64 notrap aligned little v30
 ;; @002b                               v38 = icmp ult v4, v12
 ;; @002b                               trapz v38, user17
-;;                                     v87 = ishl v4, v77  ; v77 = 3
-;; @002b                               v48 = iadd v87, v19  ; v19 = 16
+;;                                     v86 = ishl v4, v77  ; v77 = 3
+;; @002b                               v48 = iadd v86, v19  ; v19 = 16
 ;; @002b                               v53 = isub v20, v48
 ;; @002b                               v54 = uextend.i64 v53
 ;; @002b                               v55 = isub v27, v54

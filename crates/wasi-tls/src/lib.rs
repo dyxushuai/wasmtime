@@ -8,7 +8,7 @@
 //! # An example of how to configure [wasi-tls] is the following:
 //!
 //! ```rust
-//! use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+//! use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 //! use wasmtime::{
 //!     component::{Linker, ResourceTable},
 //!     Store, Engine, Result, Config
@@ -50,7 +50,7 @@
 //!     // Set up wasi-cli
 //!     let mut store = Store::new(&engine, ctx);
 //!     let mut linker = Linker::new(&engine);
-//!     wasmtime_wasi::add_to_linker_async(&mut linker)?;
+//!     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 //!
 //!     // Add wasi-tls types and turn on the feature in linker
 //!     let mut opts = LinkOptions::default();
@@ -76,31 +76,28 @@ use bytes::Bytes;
 use rustls::pki_types::ServerName;
 use std::io;
 use std::sync::Arc;
-use std::task::{ready, Poll};
+use std::task::{Poll, ready};
 use std::{future::Future, mem, pin::Pin, sync::LazyLock};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_rustls::client::TlsStream;
-use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::pipe::AsyncReadStream;
-use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
-use wasmtime_wasi::OutputStream;
-use wasmtime_wasi::{
-    async_trait,
-    bindings::io::{
-        error::Error as HostIoError,
-        poll::Pollable as HostPollable,
-        streams::{InputStream as BoxInputStream, OutputStream as BoxOutputStream},
-    },
-    Pollable, StreamError,
+use wasmtime::component::{HasData, Resource, ResourceTable};
+use wasmtime_wasi::async_trait;
+use wasmtime_wasi::p2::bindings::io::{
+    error::Error as HostIoError,
+    poll::Pollable as HostPollable,
+    streams::{InputStream as BoxInputStream, OutputStream as BoxOutputStream},
 };
+use wasmtime_wasi::p2::pipe::AsyncReadStream;
+use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError};
+use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 
 mod gen_ {
     wasmtime::component::bindgen!({
         path: "wit",
         world: "wasi:tls/imports",
         with: {
-            "wasi:io": wasmtime_wasi::bindings::io,
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
             "wasi:tls/types/client-connection": super::ClientConnection,
             "wasi:tls/types/client-handshake": super::ClientHandShake,
             "wasi:tls/types/future-client-streams": super::FutureClientStreams,
@@ -142,13 +139,19 @@ impl<'a> WasiTlsCtx<'a> {
 impl<'a> generated::types::Host for WasiTlsCtx<'a> {}
 
 /// Add the `wasi-tls` world's types to a [`wasmtime::component::Linker`].
-pub fn add_to_linker<T: Send>(
+pub fn add_to_linker<T: Send + 'static>(
     l: &mut wasmtime::component::Linker<T>,
     opts: &mut LinkOptions,
-    f: impl Fn(&mut T) -> WasiTlsCtx + Send + Sync + Copy + 'static,
+    f: fn(&mut T) -> WasiTlsCtx<'_>,
 ) -> Result<()> {
-    generated::types::add_to_linker_get_host(l, &opts, f)?;
+    generated::types::add_to_linker::<_, WasiTls>(l, &opts, f)?;
     Ok(())
+}
+
+struct WasiTls;
+
+impl HasData for WasiTls {
+    type Data<'a> = WasiTlsCtx<'a>;
 }
 
 enum TlsError {
@@ -158,7 +161,7 @@ enum TlsError {
 
     /// A failure indicated by the underlying transport stream as
     /// [`StreamError::LastOperationFailed`].
-    Io(wasmtime_wasi::IoError),
+    Io(wasmtime_wasi::p2::IoError),
 
     /// A TLS protocol error occurred.
     Tls(rustls::Error),
@@ -185,7 +188,9 @@ impl From<io::Error> for TlsError {
         let error = match error.downcast::<StreamError>() {
             Ok(StreamError::LastOperationFailed(e)) => return Self::Io(e),
             Ok(StreamError::Trap(e)) => return Self::Trap(e),
-            Ok(StreamError::Closed) => unreachable!("our wasi-to-tokio stream transformer should have translated this to a 0-sized read"),
+            Ok(StreamError::Closed) => unreachable!(
+                "our wasi-to-tokio stream transformer should have translated this to a 0-sized read"
+            ),
             Err(e) => e,
         };
 
@@ -277,7 +282,7 @@ impl<'a> generated::types::HostFutureClientStreams for WasiTlsCtx<'a> {
         &mut self,
         this: wasmtime::component::Resource<FutureClientStreams>,
     ) -> wasmtime::Result<Resource<HostPollable>> {
-        wasmtime_wasi::subscribe(self.table, this)
+        wasmtime_wasi::p2::subscribe(self.table, this)
     }
 
     fn get(
@@ -317,7 +322,7 @@ impl<'a> generated::types::HostFutureClientStreams for WasiTlsCtx<'a> {
                 return Ok(Some(Ok(Err(error))));
             }
             Err(TlsError::Tls(e)) => {
-                let error = self.table.push(wasmtime_wasi::IoError::new(e))?;
+                let error = self.table.push(wasmtime_wasi::p2::IoError::new(e))?;
                 return Ok(Some(Ok(Err(error))));
             }
         };
@@ -529,12 +534,8 @@ impl TlsWriter {
 
         self.state = WriteState::Writing(wasmtime_wasi::runtime::spawn(async move {
             while !bytes.is_empty() {
-                match stream.write(&bytes).await {
-                    Ok(n) => {
-                        let _ = bytes.split_to(n);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                let n = stream.write(&bytes).await?;
+                let _ = bytes.split_to(n);
             }
 
             Ok(stream)
@@ -673,6 +674,7 @@ fn try_lock_for_stream<TlsWriter>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::Waker;
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -686,7 +688,7 @@ mod tests {
 
         let mut fut = future_streams.ready();
 
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut cx = std::task::Context::from_waker(Waker::noop());
         assert!(fut.as_mut().poll(&mut cx).is_pending());
 
         //cancel the readiness check

@@ -1,8 +1,10 @@
-use crate::component::func::{bad_type_info, desc, LiftContext, LowerContext};
+use crate::component::func::{LiftContext, LowerContext, bad_type_info, desc};
 use crate::component::matching::InstanceType;
 use crate::component::{ComponentType, Lift, Lower};
 use crate::prelude::*;
-use crate::runtime::vm::component::{ComponentInstance, InstanceFlags, ResourceTables};
+use crate::runtime::vm::component::{
+    ComponentInstance, InstanceFlags, ResourceTables, TypedResource, TypedResourceIndex,
+};
 use crate::runtime::vm::{SendSyncPtr, VMFuncRef, ValRaw};
 use crate::store::{StoreId, StoreOpaque};
 use crate::{AsContextMut, StoreContextMut, Trap};
@@ -394,7 +396,7 @@ impl<'a> HostResourceTables<'a> {
             ResourceTables {
                 host_table: Some(host_table),
                 calls,
-                tables: None,
+                guest: None,
             },
             host_resource_data,
         )
@@ -419,13 +421,14 @@ impl<'a> HostResourceTables<'a> {
     /// if `idx` can't be lifted as an `own` (e.g. it has active borrows).
     pub fn host_resource_lift_own(&mut self, idx: HostResourceIndex) -> Result<u32> {
         let (idx, _) = self.validate_host_index(idx, true)?;
-        self.tables.resource_lift_own(None, idx)
+        self.tables.resource_lift_own(TypedResourceIndex::Host(idx))
     }
 
     /// See [`HostResourceTables::host_resource_lift_own`].
     pub fn host_resource_lift_borrow(&mut self, idx: HostResourceIndex) -> Result<u32> {
         let (idx, _) = self.validate_host_index(idx, false)?;
-        self.tables.resource_lift_borrow(None, idx)
+        self.tables
+            .resource_lift_borrow(TypedResourceIndex::Host(idx))
     }
 
     /// Lowers an `own` resource to be owned by the host.
@@ -442,13 +445,15 @@ impl<'a> HostResourceTables<'a> {
         dtor: Option<NonNull<VMFuncRef>>,
         flags: Option<InstanceFlags>,
     ) -> Result<HostResourceIndex> {
-        let idx = self.tables.resource_lower_own(None, rep)?;
+        let idx = self.tables.resource_lower_own(TypedResource::Host(rep))?;
         Ok(self.new_host_index(idx, dtor, flags))
     }
 
     /// See [`HostResourceTables::host_resource_lower_own`].
     pub fn host_resource_lower_borrow(&mut self, rep: u32) -> Result<HostResourceIndex> {
-        let idx = self.tables.resource_lower_borrow(None, rep)?;
+        let idx = self
+            .tables
+            .resource_lower_borrow(TypedResource::Host(rep))?;
         Ok(self.new_host_index(idx, None, None))
     }
 
@@ -539,7 +544,7 @@ impl<'a> HostResourceTables<'a> {
     /// in the host tables.
     fn host_resource_drop(&mut self, idx: HostResourceIndex) -> Result<Option<(u32, TableSlot)>> {
         let (idx, slot) = self.validate_host_index(idx, true)?;
-        match self.tables.resource_drop(None, idx)? {
+        match self.tables.resource_drop(TypedResourceIndex::Host(idx))? {
             Some(rep) => Ok(Some((rep, slot.unwrap()))),
             None => Ok(None),
         }
@@ -554,7 +559,8 @@ impl<'a> HostResourceTables<'a> {
         rep: u32,
         ty: TypeResourceTableIndex,
     ) -> Result<u32> {
-        self.tables.resource_lower_own(Some(ty), rep)
+        self.tables
+            .resource_lower_own(TypedResource::Component { ty, rep })
     }
 
     /// Lowers a `borrow` resource into the guest, converting the `rep`
@@ -571,15 +577,21 @@ impl<'a> HostResourceTables<'a> {
         rep: u32,
         ty: TypeResourceTableIndex,
     ) -> Result<u32> {
-        self.tables.resource_lower_borrow(Some(ty), rep)
+        self.tables
+            .resource_lower_borrow(TypedResource::Component { ty, rep })
     }
 
     /// Lifts an `own` resource from the `idx` specified from the table `ty`.
     ///
     /// This will lookup the appropriate table in the guest and return the `rep`
     /// corresponding to `idx` if it's valid.
-    pub fn guest_resource_lift_own(&mut self, idx: u32, ty: TypeResourceTableIndex) -> Result<u32> {
-        self.tables.resource_lift_own(Some(ty), idx)
+    pub fn guest_resource_lift_own(
+        &mut self,
+        index: u32,
+        ty: TypeResourceTableIndex,
+    ) -> Result<u32> {
+        self.tables
+            .resource_lift_own(TypedResourceIndex::Component { ty, index })
     }
 
     /// Lifts a `borrow` resource from the `idx` specified from the table `ty`.
@@ -588,10 +600,11 @@ impl<'a> HostResourceTables<'a> {
     /// corresponding to `idx` if it's valid.
     pub fn guest_resource_lift_borrow(
         &mut self,
-        idx: u32,
+        index: u32,
         ty: TypeResourceTableIndex,
     ) -> Result<u32> {
-        self.tables.resource_lift_borrow(Some(ty), idx)
+        self.tables
+            .resource_lift_borrow(TypedResourceIndex::Component { ty, index })
     }
 
     /// Begins a call into the component instance, starting recording of
@@ -836,35 +849,43 @@ unsafe impl<T: 'static> ComponentType for Resource<T> {
 }
 
 unsafe impl<T: 'static> Lower for Resource<T> {
-    fn lower<U>(
+    fn linear_lower_to_flat<U>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
         dst: &mut MaybeUninit<Self::Lower>,
     ) -> Result<()> {
         self.lower_to_index(cx, ty)?
-            .lower(cx, InterfaceType::U32, dst)
+            .linear_lower_to_flat(cx, InterfaceType::U32, dst)
     }
 
-    fn store<U>(
+    fn linear_lower_to_memory<U>(
         &self,
         cx: &mut LowerContext<'_, U>,
         ty: InterfaceType,
         offset: usize,
     ) -> Result<()> {
         self.lower_to_index(cx, ty)?
-            .store(cx, InterfaceType::U32, offset)
+            .linear_lower_to_memory(cx, InterfaceType::U32, offset)
     }
 }
 
 unsafe impl<T: 'static> Lift for Resource<T> {
-    fn lift(cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
-        let index = u32::lift(cx, InterfaceType::U32, src)?;
+    fn linear_lift_from_flat(
+        cx: &mut LiftContext<'_>,
+        ty: InterfaceType,
+        src: &Self::Lower,
+    ) -> Result<Self> {
+        let index = u32::linear_lift_from_flat(cx, InterfaceType::U32, src)?;
         Resource::lift_from_index(cx, ty, index)
     }
 
-    fn load(cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
-        let index = u32::load(cx, InterfaceType::U32, bytes)?;
+    fn linear_lift_from_memory(
+        cx: &mut LiftContext<'_>,
+        ty: InterfaceType,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let index = u32::linear_lift_from_memory(cx, InterfaceType::U32, bytes)?;
         Resource::lift_from_index(cx, ty, index)
     }
 }
@@ -997,10 +1018,10 @@ impl ResourceAny {
     /// Same as [`ResourceAny::resource_drop`] except for use with async stores
     /// to execute the destructor asynchronously.
     #[cfg(feature = "async")]
-    pub async fn resource_drop_async<T>(self, mut store: impl AsContextMut<Data = T>) -> Result<()>
-    where
-        T: Send,
-    {
+    pub async fn resource_drop_async<T>(
+        self,
+        mut store: impl AsContextMut<Data: Send>,
+    ) -> Result<()> {
         let mut store = store.as_context_mut();
         assert!(
             store.0.async_support(),
@@ -1011,7 +1032,7 @@ impl ResourceAny {
             .await?
     }
 
-    fn resource_drop_impl<T>(self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
+    fn resource_drop_impl<T: 'static>(self, store: &mut StoreContextMut<'_, T>) -> Result<()> {
         // Attempt to remove `self.idx` from the host table in `store`.
         //
         // This could fail if the index is invalid or if this is removing an
@@ -1117,35 +1138,43 @@ unsafe impl ComponentType for ResourceAny {
 }
 
 unsafe impl Lower for ResourceAny {
-    fn lower<T>(
+    fn linear_lower_to_flat<T>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
         dst: &mut MaybeUninit<Self::Lower>,
     ) -> Result<()> {
         self.lower_to_index(cx, ty)?
-            .lower(cx, InterfaceType::U32, dst)
+            .linear_lower_to_flat(cx, InterfaceType::U32, dst)
     }
 
-    fn store<T>(
+    fn linear_lower_to_memory<T>(
         &self,
         cx: &mut LowerContext<'_, T>,
         ty: InterfaceType,
         offset: usize,
     ) -> Result<()> {
         self.lower_to_index(cx, ty)?
-            .store(cx, InterfaceType::U32, offset)
+            .linear_lower_to_memory(cx, InterfaceType::U32, offset)
     }
 }
 
 unsafe impl Lift for ResourceAny {
-    fn lift(cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
-        let index = u32::lift(cx, InterfaceType::U32, src)?;
+    fn linear_lift_from_flat(
+        cx: &mut LiftContext<'_>,
+        ty: InterfaceType,
+        src: &Self::Lower,
+    ) -> Result<Self> {
+        let index = u32::linear_lift_from_flat(cx, InterfaceType::U32, src)?;
         ResourceAny::lift_from_index(cx, ty, index)
     }
 
-    fn load(cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
-        let index = u32::load(cx, InterfaceType::U32, bytes)?;
+    fn linear_lift_from_memory(
+        cx: &mut LiftContext<'_>,
+        ty: InterfaceType,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let index = u32::linear_lift_from_memory(cx, InterfaceType::U32, bytes)?;
         ResourceAny::lift_from_index(cx, ty, index)
     }
 }
