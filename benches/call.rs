@@ -1,5 +1,5 @@
 use criterion::measurement::WallTime;
-use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
+use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -134,8 +134,8 @@ fn bench_host_to_wasm<Params, Results>(
     typed_params: Params,
     typed_results: Results,
 ) where
-    Params: WasmParams + ToVals + Copy,
-    Results: WasmResults + ToVals + Copy + PartialEq + Debug,
+    Params: WasmParams + ToVals + Copy + Sync,
+    Results: WasmResults + ToVals + Copy + Sync + PartialEq + Debug + 'static,
 {
     // Benchmark the "typed" version, which should be faster than the versions
     // below.
@@ -360,7 +360,7 @@ fn wasm_to_host(c: &mut Criterion) {
             return;
         }
 
-        let mut typed = Linker::new(&engine);
+        let mut typed = Linker::<()>::new(&engine);
         typed
             .func_wrap_async("", "nop", |caller, _: ()| {
                 Box::new(async {
@@ -628,7 +628,8 @@ mod component {
             + PartialEq
             + Debug
             + Send
-            + Sync,
+            + Sync
+            + 'static,
     {
         // Benchmark the "typed" version.
         c.bench_function(&format!("component - host-to-wasm - typed - {name}"), |b| {

@@ -24,12 +24,12 @@ use core::fmt;
 
 use crate::alloc::string::String;
 use crate::alloc::vec::Vec;
-use crate::ir::function::{FunctionStencil, VersionMarker};
 use crate::ir::Function;
+use crate::ir::function::{FunctionStencil, VersionMarker};
 use crate::machinst::{CompiledCode, CompiledCodeStencil};
 use crate::result::CompileResult;
+use crate::{CompileError, Context, trace};
 use crate::{isa::TargetIsa, timing};
-use crate::{trace, CompileError, Context};
 use alloc::borrow::{Cow, ToOwned as _};
 use alloc::string::ToString as _;
 use cranelift_control::ControlPlane;
@@ -42,7 +42,7 @@ impl Context {
         isa: &dyn TargetIsa,
         cache_store: &mut dyn CacheKvStore,
         ctrl_plane: &mut ControlPlane,
-    ) -> CompileResult<(&CompiledCode, bool)> {
+    ) -> CompileResult<'_, (&CompiledCode, bool)> {
         let cache_key_hash = {
             let _tt = timing::try_incremental_cache();
 
@@ -100,7 +100,7 @@ impl Context {
 /// Backing storage for an incremental compilation cache, when enabled.
 pub trait CacheKvStore {
     /// Given a cache key hash, retrieves the associated opaque serialized data.
-    fn get(&self, key: &[u8]) -> Option<Cow<[u8]>>;
+    fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>>;
 
     /// Given a new cache key and a serialized blob obtained from `serialize_compiled`, stores it
     /// in the cache store.

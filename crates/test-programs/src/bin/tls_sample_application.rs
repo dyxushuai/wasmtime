@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use core::str;
 use test_programs::wasi::sockets::network::{IpAddress, IpSocketAddress, Network};
 use test_programs::wasi::sockets::tcp::{ShutdownType, TcpSocket};
@@ -7,8 +7,9 @@ use test_programs::wasi::tls::types::ClientHandshake;
 const PORT: u16 = 443;
 
 fn test_tls_sample_application(domain: &str, ip: IpAddress) -> Result<()> {
-    let request =
-        format!("GET / HTTP/1.1\r\nHost: {domain}\r\nUser-Agent: wasmtime-wasi-rust\r\n\r\n");
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {domain}\r\nUser-Agent: wasmtime-wasi-rust\r\nConnection: close\r\n\r\n"
+    );
 
     let net = Network::default();
 
@@ -25,13 +26,13 @@ fn test_tls_sample_application(domain: &str, ip: IpAddress) -> Result<()> {
     tls_output
         .blocking_write_util(request.as_bytes())
         .context("writing http request failed")?;
-    client_connection
-        .blocking_close_output(&tls_output)
-        .context("closing tls connection failed")?;
-    socket.shutdown(ShutdownType::Send)?;
     let response = tls_input
         .blocking_read_to_end()
         .context("reading http response failed")?;
+    client_connection
+        .blocking_close_output(&tls_output)
+        .context("closing tls connection failed")?;
+    socket.shutdown(ShutdownType::Both)?;
 
     if String::from_utf8(response)?.contains("HTTP/1.1 200 OK") {
         Ok(())
@@ -55,7 +56,7 @@ fn test_tls_invalid_certificate(_domain: &str, ip: IpAddress) -> Result<()> {
 
     match ClientHandshake::new(BAD_DOMAIN, tcp_input, tcp_output).blocking_finish() {
         // We're expecting an error regarding the "certificate" is some form or
-        // another. When we add more TLS backends other than rustls, this naive
+        // another. When we add more TLS backends this naive
         // check will likely need to be revisited/expanded:
         Err(e) if e.to_debug_string().contains("certificate") => Ok(()),
 
@@ -72,14 +73,16 @@ fn try_live_endpoints(test: impl Fn(&str, IpAddress) -> Result<()>) {
     let net = Network::default();
 
     for &domain in DOMAINS {
-        let lookup = net
-            .permissive_blocking_resolve_addresses(domain)
-            .unwrap()
-            .first()
-            .map(|a| a.to_owned())
-            .ok_or_else(|| anyhow!("DNS lookup failed."));
+        let result = (|| {
+            let ip = net
+                .permissive_blocking_resolve_addresses(domain)?
+                .first()
+                .map(|a| a.to_owned())
+                .ok_or_else(|| anyhow!("DNS lookup failed."))?;
+            test(&domain, ip)
+        })();
 
-        match lookup.and_then(|ip| test(&domain, ip)) {
+        match result {
             Ok(()) => return,
             Err(e) => {
                 eprintln!("test for {domain} failed: {e:#}");

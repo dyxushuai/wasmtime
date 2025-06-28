@@ -1,9 +1,9 @@
 use proptest::prelude::*;
 use wiggle::{GuestMemory, GuestPtr, GuestType};
-use wiggle_test::{impl_errno, HostMemory, MemArea, MemAreas, WasiCtx};
+use wiggle_test::{HostMemory, MemArea, MemAreas, WasiCtx, impl_errno};
 
 wiggle::from_witx!({
-    witx: ["$CARGO_MANIFEST_DIR/tests/lists.witx"],
+    witx: ["tests/lists.witx"],
 });
 
 impl_errno!(types::Errno);

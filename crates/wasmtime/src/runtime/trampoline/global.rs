@@ -1,12 +1,16 @@
-use crate::runtime::vm::{StoreBox, VMGlobalDefinition};
+use crate::runtime::vm::{ExportGlobalKind, StoreBox, VMGlobalDefinition};
 use crate::store::{AutoAssertNoGc, StoreOpaque};
+use crate::type_registry::RegisteredType;
 use crate::{GlobalType, Mutability, Result, RootedGcRefImpl, Val};
 use core::ptr::{self, NonNull};
+use wasmtime_environ::{DefinedGlobalIndex, EntityRef, Global};
 
 #[repr(C)]
 pub struct VMHostGlobalContext {
-    pub(crate) ty: GlobalType,
+    pub(crate) ty: Global,
     pub(crate) global: VMGlobalDefinition,
+
+    _registered_type: Option<RegisteredType>,
 }
 
 pub fn generate_global_export(
@@ -22,8 +26,9 @@ pub fn generate_global_export(
         },
     };
     let ctx = StoreBox::new(VMHostGlobalContext {
-        ty,
+        ty: global,
         global: VMGlobalDefinition::new(),
+        _registered_type: ty.into_registered_type(),
     });
 
     let mut store = AutoAssertNoGc::new(store);
@@ -37,7 +42,7 @@ pub fn generate_global_export(
             Val::V128(x) => global.set_u128(x.into()),
             Val::FuncRef(f) => {
                 *global.as_func_ref_mut() =
-                    f.map_or(ptr::null_mut(), |f| f.vm_func_ref(&mut store).as_ptr());
+                    f.map_or(ptr::null_mut(), |f| f.vm_func_ref(&store).as_ptr());
             }
             Val::ExternRef(x) => {
                 let new = match x {
@@ -61,10 +66,12 @@ pub fn generate_global_export(
         global
     };
 
-    store.host_globals().push(ctx);
+    let globals = store.host_globals();
+    let index = DefinedGlobalIndex::new(globals.len());
+    store.host_globals_mut().push(ctx);
     Ok(crate::runtime::vm::ExportGlobal {
         definition: NonNull::from(definition),
-        vmctx: None,
+        kind: ExportGlobalKind::Host(index),
         global,
     })
 }

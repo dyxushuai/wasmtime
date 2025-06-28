@@ -65,15 +65,16 @@
 
 use crate::dbg::DisplayList;
 use crate::dominator_tree::DominatorTree;
+use crate::dominator_tree::DominatorTreePreorder;
 use crate::entity::SparseSet;
 use crate::flowgraph::{BlockPredecessor, ControlFlowGraph};
 use crate::ir::entities::AnyEntity;
 use crate::ir::instructions::{CallInfo, InstructionFormat, ResolvedConstraint};
 use crate::ir::{self, ArgumentExtension, BlockArg, ExceptionTable};
 use crate::ir::{
-    types, ArgumentPurpose, Block, Constant, DynamicStackSlot, FuncRef, Function, GlobalValue,
-    Inst, JumpTable, MemFlags, MemoryTypeData, Opcode, SigRef, StackSlot, Type, Value, ValueDef,
-    ValueList,
+    ArgumentPurpose, Block, Constant, DynamicStackSlot, FuncRef, Function, GlobalValue, Inst,
+    JumpTable, MemFlags, MemoryTypeData, Opcode, SigRef, StackSlot, Type, Value, ValueDef,
+    ValueList, types,
 };
 use crate::isa::TargetIsa;
 use crate::print_errors::pretty_verifier_error;
@@ -202,11 +203,7 @@ impl VerifierErrors {
     /// and non-fatal otherwise.
     #[inline]
     pub fn as_result(&self) -> VerifierStepResult {
-        if self.is_empty() {
-            Ok(())
-        } else {
-            Err(())
-        }
+        if self.is_empty() { Ok(()) } else { Err(()) }
     }
 
     /// Report an error, adding it to the list of errors.
@@ -233,18 +230,18 @@ impl From<Vec<VerifierError>> for VerifierErrors {
     }
 }
 
-impl Into<Vec<VerifierError>> for VerifierErrors {
-    fn into(self) -> Vec<VerifierError> {
-        self.0
+impl From<VerifierErrors> for Vec<VerifierError> {
+    fn from(errors: VerifierErrors) -> Vec<VerifierError> {
+        errors.0
     }
 }
 
-impl Into<VerifierResult<()>> for VerifierErrors {
-    fn into(self) -> VerifierResult<()> {
-        if self.is_empty() {
+impl From<VerifierErrors> for VerifierResult<()> {
+    fn from(errors: VerifierErrors) -> VerifierResult<()> {
+        if errors.is_empty() {
             Ok(())
         } else {
-            Err(self)
+            Err(errors)
         }
     }
 }
@@ -305,6 +302,7 @@ enum BlockCallTargetType {
 struct Verifier<'a> {
     func: &'a Function,
     expected_cfg: ControlFlowGraph,
+    expected_domtree_preorder: DominatorTreePreorder,
     expected_domtree: DominatorTree,
     isa: Option<&'a dyn TargetIsa>,
 }
@@ -313,10 +311,13 @@ impl<'a> Verifier<'a> {
     pub fn new(func: &'a Function, fisa: FlagsOrIsa<'a>) -> Self {
         let expected_cfg = ControlFlowGraph::with_function(func);
         let expected_domtree = DominatorTree::with_function(func, &expected_cfg);
+        let mut expected_domtree_preorder = DominatorTreePreorder::new();
+        expected_domtree_preorder.compute(&expected_domtree);
         Self {
             func,
             expected_cfg,
             expected_domtree,
+            expected_domtree_preorder,
             isa: fisa.isa,
         }
     }
@@ -1004,10 +1005,11 @@ impl<'a> Verifier<'a> {
                 }
                 // Defining instruction dominates the instruction that uses the value.
                 if is_reachable {
-                    if !self
-                        .expected_domtree
-                        .dominates(def_inst, loc_inst, &self.func.layout)
-                    {
+                    if !self.expected_domtree_preorder.dominates_inst(
+                        def_inst,
+                        loc_inst,
+                        &self.func.layout,
+                    ) {
                         return errors.fatal((
                             loc_inst,
                             self.context(loc_inst),
@@ -1040,12 +1042,9 @@ impl<'a> Verifier<'a> {
                         format!("{v} is defined by {block} which is not in the layout"),
                     ));
                 }
+                let user_block = self.func.layout.inst_block(loc_inst).expect("Expected instruction to be in a block as we're traversing code already in layout");
                 // The defining block dominates the instruction using this value.
-                if is_reachable
-                    && !self
-                        .expected_domtree
-                        .dominates(block, loc_inst, &self.func.layout)
-                {
+                if is_reachable && !self.expected_domtree_preorder.dominates(block, user_block) {
                     return errors.fatal((
                         loc_inst,
                         self.context(loc_inst),
@@ -1464,23 +1463,6 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn pointer_type_or_error(&self, inst: Inst, errors: &mut VerifierErrors) -> Result<Type, ()> {
-        // Ensure we have an ISA so we know what the pointer size is.
-        if let Some(isa) = self.isa {
-            Ok(isa.pointer_type())
-        } else {
-            errors
-                .fatal((
-                    inst,
-                    self.context(inst),
-                    format!("need an ISA to validate correct pointer type"),
-                ))
-                // Will always return an `Err`, but the `Ok` type
-                // doesn't match, so map it.
-                .map(|_| Type::default())
-        }
-    }
-
     fn typecheck_block_call(
         &self,
         inst: Inst,
@@ -1504,7 +1486,9 @@ impl<'a> Verifier<'a> {
             ));
         }
         for (arg, param) in args.zip(block_params.iter()) {
-            let arg_ty = self.block_call_arg_ty(arg, inst, target_type, errors)?;
+            let Some(arg_ty) = self.block_call_arg_ty(arg, inst, target_type, errors)? else {
+                continue;
+            };
             let param_ty = self.func.dfg.value_type(*param);
             if arg_ty != param_ty {
                 errors.nonfatal((
@@ -1523,9 +1507,9 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         target_type: BlockCallTargetType,
         errors: &mut VerifierErrors,
-    ) -> Result<Type, ()> {
+    ) -> Result<Option<Type>, ()> {
         match arg {
-            BlockArg::Value(v) => Ok(self.func.dfg.value_type(v)),
+            BlockArg::Value(v) => Ok(Some(self.func.dfg.value_type(v))),
             BlockArg::TryCallRet(_) | BlockArg::TryCallExn(_) => {
                 // Get the invoked signature.
                 let et = match self.func.dfg.insts[inst].exception_table() {
@@ -1548,7 +1532,7 @@ impl<'a> Verifier<'a> {
                     (BlockArg::TryCallRet(i), BlockCallTargetType::ExNormalRet)
                         if (i as usize) < sig.returns.len() =>
                     {
-                        Ok(sig.returns[i as usize].value_type)
+                        Ok(Some(sig.returns[i as usize].value_type))
                     }
                     (BlockArg::TryCallRet(_), BlockCallTargetType::ExNormalRet) => {
                         errors.fatal((
@@ -1567,20 +1551,24 @@ impl<'a> Verifier<'a> {
                         unreachable!()
                     }
                     (BlockArg::TryCallExn(i), BlockCallTargetType::Exception) => {
-                        match sig
-                            .call_conv
-                            .exception_payload_types(self.pointer_type_or_error(inst, errors)?)
-                            .get(i as usize)
-                        {
-                            Some(ty) => Ok(*ty),
-                            None => {
-                                errors.fatal((
-                                    inst,
-                                    self.context(inst),
-                                    format!("out-of-bounds `exnN` block argument"),
-                                ))?;
-                                unreachable!()
+                        if let Some(isa) = self.isa {
+                            match sig
+                                .call_conv
+                                .exception_payload_types(isa.pointer_type())
+                                .get(i as usize)
+                            {
+                                Some(ty) => Ok(Some(*ty)),
+                                None => {
+                                    errors.fatal((
+                                        inst,
+                                        self.context(inst),
+                                        format!("out-of-bounds `exnN` block argument"),
+                                    ))?;
+                                    unreachable!()
+                                }
                             }
+                        } else {
+                            Ok(None)
                         }
                     }
                     (BlockArg::TryCallExn(_), _) => {
@@ -1975,11 +1963,7 @@ impl<'a> Verifier<'a> {
             }
         }
 
-        if errors.has_error() {
-            Err(())
-        } else {
-            Ok(())
-        }
+        if errors.has_error() { Err(()) } else { Ok(()) }
     }
 
     pub fn run(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
@@ -2020,7 +2004,7 @@ impl<'a> Verifier<'a> {
 mod tests {
     use super::{Verifier, VerifierError, VerifierErrors};
     use crate::ir::instructions::{InstructionData, Opcode};
-    use crate::ir::{types, AbiParam, Function, Type};
+    use crate::ir::{AbiParam, Function, Type, types};
     use crate::settings;
 
     macro_rules! assert_err_with_msg {

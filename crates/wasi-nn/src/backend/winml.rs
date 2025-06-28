@@ -9,20 +9,21 @@
 
 use crate::backend::{
     BackendError, BackendExecutionContext, BackendFromDir, BackendGraph, BackendInner, Id,
+    NamedTensor,
 };
 use crate::wit::{ExecutionTarget, GraphEncoding, Tensor, TensorType};
 use crate::{ExecutionContext, Graph};
 use std::{fs::File, io::Read, mem::size_of, path::Path};
-use windows::core::{ComInterface, Error, IInspectable, HSTRING};
-use windows::Foundation::Collections::IVectorView;
-use windows::Storage::Streams::{
-    DataWriter, InMemoryRandomAccessStream, RandomAccessStreamReference,
-};
 use windows::AI::MachineLearning::{
     ILearningModelFeatureDescriptor, LearningModel, LearningModelBinding, LearningModelDevice,
     LearningModelDeviceKind, LearningModelEvaluationResult, LearningModelSession,
     TensorFeatureDescriptor, TensorFloat, TensorFloat16Bit, TensorInt64Bit, TensorKind,
 };
+use windows::Foundation::Collections::IVectorView;
+use windows::Storage::Streams::{
+    DataWriter, InMemoryRandomAccessStream, RandomAccessStreamReference,
+};
+use windows::core::{ComInterface, Error, HSTRING, IInspectable};
 
 #[derive(Default)]
 pub struct WinMLBackend();
@@ -148,9 +149,70 @@ impl BackendExecutionContext for WinMLExecutionContext {
         Ok(())
     }
 
-    fn compute(&mut self) -> Result<(), BackendError> {
-        self.result = Some(self.session.Evaluate(&self.binding, &HSTRING::new())?);
-        Ok(())
+    fn compute(
+        &mut self,
+        inputs: Option<Vec<NamedTensor>>,
+    ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
+        match inputs {
+            Some(inputs) => {
+                // Clear previous bindings
+                self.binding = LearningModelBinding::CreateFromSession(&self.session)?;
+
+                let input_features = self.session.Model()?.InputFeatures()?;
+                for input in &inputs {
+                    let index = input_features
+                        .clone()
+                        .into_iter()
+                        .position(|d| d.Name().unwrap() == input.name)
+                        .ok_or_else(|| {
+                            BackendError::BackendAccess(anyhow::anyhow!(
+                                "Unknown input tensor name: {}",
+                                input.name
+                            ))
+                        })? as u32;
+
+                    let input_feature = input_features.GetAt(index)?;
+                    let inspectable = to_inspectable(&input.tensor)?;
+                    self.binding.Bind(&input_feature.Name()?, &inspectable)?;
+                }
+
+                self.result = Some(self.session.Evaluate(&self.binding, &HSTRING::new())?);
+
+                let output_features = self.session.Model()?.OutputFeatures()?;
+                let mut output_tensors = Vec::new();
+                for i in 0..output_features.Size()? {
+                    let output_feature = output_features.GetAt(i)?;
+                    let tensor_kind = match output_feature.Kind()? {
+                        windows::AI::MachineLearning::LearningModelFeatureKind::Tensor => {
+                            output_feature
+                                .cast::<TensorFeatureDescriptor>()?
+                                .TensorKind()?
+                        }
+                        _ => unimplemented!(
+                            "the WinML backend only supports tensors, found: {:?}",
+                            output_feature.Kind()
+                        ),
+                    };
+                    let tensor = to_tensor(
+                        self.result
+                            .as_ref()
+                            .unwrap()
+                            .Outputs()?
+                            .Lookup(&output_feature.Name()?)?,
+                        tensor_kind,
+                    )?;
+                    output_tensors.push(NamedTensor {
+                        name: output_feature.Name()?.to_string(),
+                        tensor,
+                    });
+                }
+                Ok(Some(output_tensors))
+            }
+            None => {
+                self.result = Some(self.session.Evaluate(&self.binding, &HSTRING::new())?);
+                Ok(None)
+            }
+        }
     }
 
     fn get_output(&mut self, id: Id) -> Result<Tensor, BackendError> {

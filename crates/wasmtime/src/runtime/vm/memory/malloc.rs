@@ -5,8 +5,8 @@
 //! handle memory allocation failures.
 
 use crate::prelude::*;
-use crate::runtime::vm::memory::{MemoryBase, RuntimeLinearMemory};
 use crate::runtime::vm::SendSyncPtr;
+use crate::runtime::vm::memory::{MemoryBase, RuntimeLinearMemory};
 use core::mem;
 use core::ptr::NonNull;
 use wasmtime_environ::Tunables;
@@ -82,6 +82,14 @@ impl RuntimeLinearMemory for MallocMemory {
 
     fn base(&self) -> MemoryBase {
         MemoryBase::Raw(self.base_ptr)
+    }
+
+    fn vmmemory(&self) -> crate::vm::VMMemoryDefinition {
+        let base = self.base_ptr.as_non_null();
+        crate::vm::VMMemoryDefinition {
+            base: base.into(),
+            current_length: self.byte_len.into(),
+        }
     }
 }
 
