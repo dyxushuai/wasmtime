@@ -37,31 +37,31 @@ make_vendor() {
 cache_dir=$(mktemp -d)
 
 make_vendor "wasi-io" "
-  io@v0.2.3
+  io@v0.2.6
 "
 
-make_vendor "wasi" "
-  cli@v0.2.3
-  clocks@v0.2.3
-  filesystem@v0.2.3
-  io@v0.2.3
-  random@v0.2.3
-  sockets@v0.2.3
+make_vendor "wasi/src/p2" "
+  cli@v0.2.6
+  clocks@v0.2.6
+  filesystem@v0.2.6
+  io@v0.2.6
+  random@v0.2.6
+  sockets@v0.2.6
 "
 
 make_vendor "wasi-http" "
-  cli@v0.2.3
-  clocks@v0.2.3
-  filesystem@v0.2.3
-  io@v0.2.3
-  random@v0.2.3
-  sockets@v0.2.3
-  http@v0.2.3
+  cli@v0.2.6
+  clocks@v0.2.6
+  filesystem@v0.2.6
+  io@v0.2.6
+  random@v0.2.6
+  sockets@v0.2.6
+  http@v0.2.6
 "
 
 make_vendor "wasi-tls" "
-  io@v0.2.3
-  tls@v0.2.0-draft+d6fbdc7
+  io@v0.2.6
+  tls@v0.2.0-draft+505fc98
 "
 
 make_vendor "wasi-config" "config@f4d699b"
@@ -73,6 +73,6 @@ rm -rf $cache_dir
 # Separately (for now), vendor the `wasi-nn` WIT files since their retrieval is
 # slightly different than above.
 repo=https://raw.githubusercontent.com/WebAssembly/wasi-nn
-revision=0.2.0-rc-2024-08-19
+revision=0.2.0-rc-2024-10-28
 curl -L $repo/$revision/wasi-nn.witx -o crates/wasi-nn/witx/wasi-nn.witx
 curl -L $repo/$revision/wit/wasi-nn.wit -o crates/wasi-nn/wit/wasi-nn.wit

@@ -14,16 +14,16 @@
 ;;       movq    0x10(%r11), %r11
 ;;       addq    $0x10, %r11
 ;;       cmpq    %rsp, %r11
-;;       ja      0x60
+;;       ja      0x68
 ;;   1c: movq    %rdi, %r14
 ;;       subq    $0x10, %rsp
 ;;       movq    %rdi, 8(%rsp)
 ;;       movq    %rsi, (%rsp)
 ;;       movl    $3, %eax
-;;       movdqu  0x37(%rip), %xmm0
+;;       movdqu  0x34(%rip), %xmm0
 ;;       andl    $0x3f, %eax
 ;;       vmovd   %eax, %xmm15
-;;       vmovdqu 0x38(%rip), %xmm1
+;;       vmovdqu 0x33(%rip), %xmm1
 ;;       vpsrlq  %xmm15, %xmm1, %xmm1
 ;;       vpsrlq  %xmm15, %xmm0, %xmm0
 ;;       vpxor   %xmm1, %xmm0, %xmm0
@@ -31,11 +31,7 @@
 ;;       addq    $0x10, %rsp
 ;;       popq    %rbp
 ;;       retq
-;;   60: ud2
-;;   62: addb    %al, (%rax)
-;;   64: addb    %al, (%rax)
-;;   66: addb    %al, (%rax)
-;;   68: addb    %al, (%rax)
+;;   68: ud2
 ;;   6a: addb    %al, (%rax)
 ;;   6c: addb    %al, (%rax)
 ;;   6e: addb    %al, (%rax)

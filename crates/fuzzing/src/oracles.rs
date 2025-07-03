@@ -29,7 +29,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use wasmtime::*;
 use wasmtime_wast::WastContext;
@@ -409,9 +409,15 @@ fn unwrap_instance(
         return None;
     }
 
-    // Allow traps which can happen normally with `unreachable` or a
-    // timeout or such
-    if e.is::<Trap>() {
+    // Allow traps which can happen normally with `unreachable` or a timeout or
+    // such.
+    if e.is::<Trap>()
+        // Also allow failures to instantiate as a result of hitting pooling
+        // limits.
+        || e.is::<wasmtime::PoolConcurrencyLimitError>()
+        // And GC heap OOMs.
+        || e.is::<wasmtime::GcHeapOutOfMemory<()>>()
+    {
         return None;
     }
 
@@ -421,11 +427,6 @@ fn unwrap_instance(
     // every single module under the sun due to using name-based resolution
     // rather than positional-based resolution
     if string.contains("incompatible import type") {
-        return None;
-    }
-
-    // Also allow failures to instantiate as a result of hitting pooling limits.
-    if e.is::<wasmtime::PoolConcurrencyLimitError>() {
         return None;
     }
 
@@ -701,11 +702,12 @@ pub fn wast_test(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<()> {
 
     let mut fuzz_config: generators::Config = u.arbitrary()?;
     let test: generators::WastTest = u.arbitrary()?;
-    if u.arbitrary()? {
-        fuzz_config.enable_async(u)?;
-    }
 
     let test = &test.test;
+
+    if test.config.component_model_async() || u.arbitrary()? {
+        fuzz_config.enable_async(u)?;
+    }
 
     // Discard tests that allocate a lot of memory as we don't want to OOM the
     // fuzzer and we also limit memory growth which would cause the test to
@@ -775,7 +777,7 @@ pub fn table_ops(
     mut fuzz_config: generators::Config,
     ops: generators::table_ops::TableOps,
 ) -> Result<usize> {
-    let expected_drops = Arc::new(AtomicUsize::new(ops.num_params as usize));
+    let expected_drops = Arc::new(AtomicUsize::new(0));
     let num_dropped = Arc::new(AtomicUsize::new(0));
 
     let num_gcs = Arc::new(AtomicUsize::new(0));
@@ -812,13 +814,20 @@ pub fn table_ops(
                     caller.gc(None);
                 }
 
-                let a = ExternRef::new(&mut caller, CountDrops(num_dropped.clone()))?;
-                let b = ExternRef::new(&mut caller, CountDrops(num_dropped.clone()))?;
-                let c = ExternRef::new(&mut caller, CountDrops(num_dropped.clone()))?;
+                let a = ExternRef::new(
+                    &mut caller,
+                    CountDrops::new(&expected_drops, num_dropped.clone()),
+                )?;
+                let b = ExternRef::new(
+                    &mut caller,
+                    CountDrops::new(&expected_drops, num_dropped.clone()),
+                )?;
+                let c = ExternRef::new(
+                    &mut caller,
+                    CountDrops::new(&expected_drops, num_dropped.clone()),
+                )?;
 
                 log::info!("table_ops: gc() -> ({:?}, {:?}, {:?})", a, b, c);
-
-                expected_drops.fetch_add(3, SeqCst);
                 results[0] = Some(a).into();
                 results[1] = Some(b).into();
                 results[2] = Some(c).into();
@@ -881,10 +890,18 @@ pub fn table_ops(
             move |mut caller, _params, results| {
                 log::info!("table_ops: make_refs");
 
-                let a = ExternRef::new(&mut caller, CountDrops(num_dropped.clone()))?;
-                let b = ExternRef::new(&mut caller, CountDrops(num_dropped.clone()))?;
-                let c = ExternRef::new(&mut caller, CountDrops(num_dropped.clone()))?;
-                expected_drops.fetch_add(3, SeqCst);
+                let a = ExternRef::new(
+                    &mut caller,
+                    CountDrops::new(&expected_drops, num_dropped.clone()),
+                )?;
+                let b = ExternRef::new(
+                    &mut caller,
+                    CountDrops::new(&expected_drops, num_dropped.clone()),
+                )?;
+                let c = ExternRef::new(
+                    &mut caller,
+                    CountDrops::new(&expected_drops, num_dropped.clone()),
+                )?;
 
                 log::info!("table_ops: make_refs() -> ({:?}, {:?}, {:?})", a, b, c);
 
@@ -911,7 +928,7 @@ pub fn table_ops(
                 .map(|_| {
                     Ok(Val::ExternRef(Some(ExternRef::new(
                         &mut scope,
-                        CountDrops(num_dropped.clone()),
+                        CountDrops::new(&expected_drops, num_dropped.clone()),
                     )?)))
                 })
                 .collect::<Result<_>>()?;
@@ -925,15 +942,18 @@ pub fn table_ops(
             // and `table.set` generated or an out-of-fuel trap. Otherwise any other
             // error is unexpected and should fail fuzzing.
             log::info!("table_ops: calling into Wasm `run` function");
-            let trap = run
-                .call(&mut scope, &args, &mut [])
-                .unwrap_err()
-                .downcast::<Trap>()
-                .unwrap();
-
-            match trap {
-                Trap::TableOutOfBounds | Trap::OutOfFuel => {}
-                _ => panic!("unexpected trap: {trap}"),
+            let err = run.call(&mut scope, &args, &mut []).unwrap_err();
+            match err.downcast::<GcHeapOutOfMemory<CountDrops>>() {
+                Ok(_oom) => {}
+                Err(err) => {
+                    let trap = err
+                        .downcast::<Trap>()
+                        .expect("if not GC oom, error should be a Wasm trap");
+                    match trap {
+                        Trap::TableOutOfBounds | Trap::OutOfFuel => {}
+                        _ => panic!("unexpected trap: {trap}"),
+                    }
+                }
             }
         }
 
@@ -946,9 +966,21 @@ pub fn table_ops(
 
     struct CountDrops(Arc<AtomicUsize>);
 
+    impl CountDrops {
+        fn new(expected_drops: &AtomicUsize, num_dropped: Arc<AtomicUsize>) -> Self {
+            let expected = expected_drops.fetch_add(1, SeqCst);
+            log::info!(
+                "CountDrops::new: expected drops: {expected} -> {}",
+                expected + 1
+            );
+            Self(num_dropped)
+        }
+    }
+
     impl Drop for CountDrops {
         fn drop(&mut self) {
-            self.0.fetch_add(1, SeqCst);
+            let drops = self.0.fetch_add(1, SeqCst);
+            log::info!("CountDrops::drop: actual drops: {drops} -> {}", drops + 1);
         }
     }
 }
@@ -1012,7 +1044,7 @@ pub fn dynamic_component_api_target(input: &mut arbitrary::Unstructured) -> arbi
     use wasmtime::component::{Component, Linker, Val};
     use wasmtime_test_util::component::FuncExt;
     use wasmtime_test_util::component_fuzz::{
-        TestCase, Type, EXPORT_FUNCTION, IMPORT_FUNCTION, MAX_TYPE_DEPTH,
+        EXPORT_FUNCTION, IMPORT_FUNCTION, MAX_TYPE_DEPTH, TestCase, Type,
     };
 
     crate::init_fuzzing();
@@ -1141,9 +1173,9 @@ pub fn call_async(wasm: &[u8], config: &generators::Config, mut poll_amts: &[u32
                 .into()
             }
             other_ty => match other_ty.default_value(&mut store) {
-                Some(item) => item,
-                None => {
-                    log::warn!("couldn't create import for {import:?}");
+                Ok(item) => item,
+                Err(e) => {
+                    log::warn!("couldn't create import for {import:?}: {e:?}");
                     return;
                 }
             },
@@ -1289,7 +1321,7 @@ pub fn call_async(wasm: &[u8], config: &generators::Config, mut poll_amts: &[u32
 
     fn run<F: Future>(future: F) -> F::Output {
         let mut f = Box::pin(future);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut cx = Context::from_waker(Waker::noop());
         loop {
             match f.as_mut().poll(&mut cx) {
                 Poll::Ready(val) => break val,

@@ -2,18 +2,18 @@
 
 use crate::async_functions::{CountPending, PollOnce};
 use anyhow::anyhow;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasmtime::*;
 use wasmtime_test_macros::wasmtime_test;
 
-fn build_engine(config: &mut Config) -> Arc<Engine> {
+fn build_engine(config: &mut Config) -> Result<Arc<Engine>> {
     config.async_support(true);
     config.epoch_interruption(true);
-    Arc::new(Engine::new(&config).unwrap())
+    Ok(Arc::new(Engine::new(&config)?))
 }
 
-fn make_env<T>(engine: &Engine) -> Linker<T> {
+fn make_env<T: 'static>(engine: &Engine) -> Linker<T> {
     let mut linker = Linker::new(engine);
     let engine = engine.clone();
 
@@ -51,10 +51,10 @@ async fn run_and_count_yields_or_trap<F: Fn(Arc<Engine>)>(
     initial: u64,
     delta: InterruptMode,
     setup_func: F,
-) -> Option<(usize, usize)> {
-    let engine = build_engine(config);
-    let linker = make_env(&engine);
-    let module = Module::new(&engine, wasm).unwrap();
+) -> Result<Option<(usize, usize)>> {
+    let engine = build_engine(config)?;
+    let linker = make_env::<usize>(&engine);
+    let module = Module::new(&engine, wasm)?;
     let mut store = Store::new(&engine, 0);
     store.set_epoch_deadline(initial);
     match delta {
@@ -72,16 +72,16 @@ async fn run_and_count_yields_or_trap<F: Fn(Arc<Engine>)>(
     let engine_clone = engine.clone();
     setup_func(engine_clone);
 
-    let instance = linker.instantiate_async(&mut store, &module).await.unwrap();
+    let instance = linker.instantiate_async(&mut store, &module).await?;
     let f = instance.get_func(&mut store, "run").unwrap();
     let (result, yields) =
         CountPending::new(Box::pin(f.call_async(&mut store, &[], &mut []))).await;
     let store = store.data();
-    return result.ok().map(|_| (yields, *store));
+    Ok(result.ok().map(|_| (yields, *store)))
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_yield_at_func_entry(config: &mut Config) {
+async fn epoch_yield_at_func_entry(config: &mut Config) -> Result<()> {
     // Should yield at start of call to func $subfunc.
     assert_eq!(
         Some((1, 0)),
@@ -99,12 +99,13 @@ async fn epoch_yield_at_func_entry(config: &mut Config) {
             InterruptMode::Yield(1),
             |_| {},
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_yield_at_loop_header(config: &mut Config) {
+async fn epoch_yield_at_loop_header(config: &mut Config) -> Result<()> {
     // Should yield at top of loop, once per five iters.
     assert_eq!(
         Some((2, 0)),
@@ -124,12 +125,13 @@ async fn epoch_yield_at_loop_header(config: &mut Config) {
             InterruptMode::Yield(5),
             |_| {},
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_yield_immediate(config: &mut Config) {
+async fn epoch_yield_immediate(config: &mut Config) -> Result<()> {
     // We should see one yield immediately when the initial deadline
     // is zero.
     assert_eq!(
@@ -145,12 +147,13 @@ async fn epoch_yield_immediate(config: &mut Config) {
             InterruptMode::Yield(1),
             |_| {},
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_yield_only_once(config: &mut Config) {
+async fn epoch_yield_only_once(config: &mut Config) -> Result<()> {
     // We should yield from the subfunction, and then when we return
     // to the outer function and hit another loop header, we should
     // not yield again (the double-check block will reload the correct
@@ -176,12 +179,13 @@ async fn epoch_yield_only_once(config: &mut Config) {
             InterruptMode::Yield(1),
             |_| {},
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_interrupt_infinite_loop(config: &mut Config) {
+async fn epoch_interrupt_infinite_loop(config: &mut Config) -> Result<()> {
     assert_eq!(
         None,
         run_and_count_yields_or_trap(
@@ -202,12 +206,13 @@ async fn epoch_interrupt_infinite_loop(config: &mut Config) {
                 });
             },
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_interrupt_function_entries(config: &mut Config) {
+async fn epoch_interrupt_function_entries(config: &mut Config) -> Result<()> {
     assert_eq!(
         None,
         run_and_count_yields_or_trap(
@@ -325,12 +330,13 @@ async fn epoch_interrupt_function_entries(config: &mut Config) {
                 });
             },
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_callback_continue(config: &mut Config) {
+async fn epoch_callback_continue(config: &mut Config) -> Result<()> {
     assert_eq!(
         Some((0, 1)),
         run_and_count_yields_or_trap(
@@ -351,12 +357,13 @@ async fn epoch_callback_continue(config: &mut Config) {
             }),
             |_| {},
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_callback_yield(config: &mut Config) {
+async fn epoch_callback_yield(config: &mut Config) -> Result<()> {
     assert_eq!(
         Some((1, 1)),
         run_and_count_yields_or_trap(
@@ -377,12 +384,42 @@ async fn epoch_callback_yield(config: &mut Config) {
             }),
             |_| {},
         )
-        .await
+        .await?
     );
+
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn epoch_callback_trap(config: &mut Config) {
+async fn epoch_callback_yield_custom(config: &mut Config) -> Result<()> {
+    assert_eq!(
+        Some((1, 1)),
+        run_and_count_yields_or_trap(
+            config,
+            "
+            (module
+                (import \"\" \"bump_epoch\" (func $bump))
+                (func (export \"run\")
+                    call $bump  ;; bump epoch
+                    call $subfunc) ;; call func; will notice new epoch and yield
+                (func $subfunc))
+            ",
+            1,
+            InterruptMode::Callback(|mut cx| {
+                let s = cx.data_mut();
+                *s += 1;
+                let fut = Box::pin(tokio::task::yield_now());
+                Ok(UpdateDeadline::YieldCustom(1, fut))
+            }),
+            |_| {},
+        )
+        .await?
+    );
+    Ok(())
+}
+
+#[wasmtime_test(with = "#[tokio::test]")]
+async fn epoch_callback_trap(config: &mut Config) -> Result<()> {
     assert_eq!(
         None,
         run_and_count_yields_or_trap(
@@ -399,12 +436,13 @@ async fn epoch_callback_trap(config: &mut Config) {
             InterruptMode::Callback(|_| Err(anyhow!("Failing in callback"))),
             |_| {},
         )
-        .await
+        .await?
     );
+    Ok(())
 }
 
 #[wasmtime_test(with = "#[tokio::test]")]
-async fn drop_future_on_epoch_yield(config: &mut Config) {
+async fn drop_future_on_epoch_yield(config: &mut Config) -> Result<()> {
     let wasm = "
     (module
       (import \"\" \"bump_epoch\" (func $bump))
@@ -418,8 +456,8 @@ async fn drop_future_on_epoch_yield(config: &mut Config) {
       (func $subfunc))
     ";
 
-    let engine = build_engine(config);
-    let mut linker = make_env(&engine);
+    let engine = build_engine(config)?;
+    let mut linker = make_env::<()>(&engine);
 
     // Create a few helpers for the Wasm to call.
     let alive_flag = Arc::new(AtomicBool::new(false));
@@ -457,4 +495,5 @@ async fn drop_future_on_epoch_yield(config: &mut Config) {
     let _ = PollOnce::new(Box::pin(f.call_async(&mut store, &[], &mut []))).await;
 
     assert_eq!(true, alive_flag.load(Ordering::Acquire));
+    Ok(())
 }

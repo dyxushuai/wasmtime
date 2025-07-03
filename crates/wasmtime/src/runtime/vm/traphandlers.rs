@@ -15,18 +15,20 @@ mod signals;
 #[cfg(all(has_native_signals))]
 pub use self::signals::*;
 
-use crate::prelude::*;
 use crate::runtime::module::lookup_code;
 use crate::runtime::store::{ExecutorRef, StoreOpaque};
 use crate::runtime::vm::sys::traphandlers;
-use crate::runtime::vm::{InterpreterRef, VMContext, VMStoreContext};
+use crate::runtime::vm::{InterpreterRef, VMContext, VMStoreContext, f32x4, f64x2, i8x16};
+use crate::{EntryStoreContext, prelude::*};
 use crate::{StoreContextMut, WasmBacktrace};
 use core::cell::Cell;
 use core::num::NonZeroU32;
-use core::ops::Range;
 use core::ptr::{self, NonNull};
 
 pub use self::backtrace::Backtrace;
+#[cfg(feature = "gc")]
+pub use wasmtime_unwinder::Frame;
+
 pub use self::coredump::CoreDumpStack;
 pub use self::tls::tls_eager_initialize;
 #[cfg(feature = "async")]
@@ -176,6 +178,11 @@ host_result_no_catch! {
     u32,
     *mut u8,
     u64,
+    f32,
+    f64,
+    i8x16,
+    f32x4,
+    f64x2,
 }
 
 impl HostResult for NonNull<u8> {
@@ -300,6 +307,14 @@ unsafe impl HostResultHasUnwindSentinel for core::convert::Infallible {
     }
 }
 
+unsafe impl HostResultHasUnwindSentinel for bool {
+    type Abi = u32;
+    const SENTINEL: Self::Abi = u32::MAX;
+    fn into_abi(self) -> Self::Abi {
+        u32::from(self)
+    }
+}
+
 /// Stores trace message with backtrace.
 #[derive(Debug)]
 pub struct Trap {
@@ -365,6 +380,7 @@ impl From<wasmtime_environ::Trap> for TrapReason {
 /// longjmp'd over and none of its destructors on the stack may be run.
 pub unsafe fn catch_traps<T, F>(
     store: &mut StoreContextMut<'_, T>,
+    old_state: &mut EntryStoreContext,
     mut closure: F,
 ) -> Result<(), Box<Trap>>
 where
@@ -372,7 +388,7 @@ where
 {
     let caller = store.0.default_caller();
 
-    let result = CallThreadState::new(store.0).with(|cx| match store.0.executor() {
+    let result = CallThreadState::new(store.0, old_state).with(|cx| match store.0.executor() {
         // In interpreted mode directly invoke the host closure since we won't
         // be using host-based `setjmp`/`longjmp` as that's not going to save
         // the context we want.
@@ -423,7 +439,8 @@ where
 // usage of its accessor methods.
 mod call_thread_state {
     use super::*;
-    use crate::runtime::vm::Unwind;
+    use crate::EntryStoreContext;
+    use crate::runtime::vm::{Unwind, VMStackChain};
 
     /// Temporary state stored on the stack which is registered in the `tls`
     /// module below for calls into wasm.
@@ -459,20 +476,16 @@ mod call_thread_state {
         pub(crate) unwinder: &'static dyn Unwind,
 
         pub(super) prev: Cell<tls::Ptr>,
-        #[cfg(all(has_native_signals, unix))]
-        pub(crate) async_guard_range: Range<*mut u8>,
 
-        // The values of `VMStoreContext::last_wasm_{exit_{pc,fp},entry_sp}` for
-        // the *previous* `CallThreadState` for this same store/limits. Our
-        // *current* last wasm PC/FP/SP are saved in `self.vm_store_context`. We
-        // save a copy of the old registers here because the `VMStoreContext`
-        // typically doesn't change across nested calls into Wasm (i.e. they are
-        // typically calls back into the same store and `self.vm_store_context
-        // == self.prev.vm_store_context`) and we must to maintain the list of
-        // contiguous-Wasm-frames stack regions for backtracing purposes.
-        old_last_wasm_exit_fp: Cell<usize>,
-        old_last_wasm_exit_pc: Cell<usize>,
-        old_last_wasm_entry_fp: Cell<usize>,
+        // The state of the runtime for the *previous* `CallThreadState` for
+        // this same store. Our *current* state is saved in `self.vm_store_context`,
+        // etc. We need access to the old values of these
+        // fields because the `VMStoreContext` typically doesn't change across
+        // nested calls into Wasm (i.e. they are typically calls back into the
+        // same store and `self.vm_store_context == self.prev.vm_store_context`) and we must to
+        // maintain the list of contiguous-Wasm-frames stack regions for
+        // backtracing purposes.
+        old_state: *mut EntryStoreContext,
     }
 
     impl Drop for CallThreadState {
@@ -480,13 +493,6 @@ mod call_thread_state {
             // Unwind information should not be present as it should have
             // already been processed.
             debug_assert!(self.unwind.replace(None).is_none());
-
-            unsafe {
-                let cx = self.vm_store_context.as_ref();
-                *cx.last_wasm_exit_fp.get() = self.old_last_wasm_exit_fp.get();
-                *cx.last_wasm_exit_pc.get() = self.old_last_wasm_exit_pc.get();
-                *cx.last_wasm_entry_fp.get() = self.old_last_wasm_entry_fp.get();
-            }
         }
     }
 
@@ -494,11 +500,10 @@ mod call_thread_state {
         pub const JMP_BUF_INTERPRETER_SENTINEL: *mut u8 = 1 as *mut u8;
 
         #[inline]
-        pub(super) fn new(store: &mut StoreOpaque) -> CallThreadState {
-            // Don't try to plumb #[cfg] everywhere for this field, just pretend
-            // we're using it on miri/windows to silence compiler warnings.
-            let _: Range<_> = store.async_guard_range();
-
+        pub(super) fn new(
+            store: &mut StoreOpaque,
+            old_state: *mut EntryStoreContext,
+        ) -> CallThreadState {
             CallThreadState {
                 unwind: Cell::new(None),
                 unwinder: store.unwinder(),
@@ -509,34 +514,29 @@ mod call_thread_state {
                 #[cfg(feature = "coredump")]
                 capture_coredump: store.engine().config().coredump_on_trap,
                 vm_store_context: store.vm_store_context_ptr(),
-                #[cfg(all(has_native_signals, unix))]
-                async_guard_range: store.async_guard_range(),
                 prev: Cell::new(ptr::null()),
-                old_last_wasm_exit_fp: Cell::new(unsafe {
-                    *store.vm_store_context().last_wasm_exit_fp.get()
-                }),
-                old_last_wasm_exit_pc: Cell::new(unsafe {
-                    *store.vm_store_context().last_wasm_exit_pc.get()
-                }),
-                old_last_wasm_entry_fp: Cell::new(unsafe {
-                    *store.vm_store_context().last_wasm_entry_fp.get()
-                }),
+                old_state,
             }
         }
 
         /// Get the saved FP upon exit from Wasm for the previous `CallThreadState`.
-        pub fn old_last_wasm_exit_fp(&self) -> usize {
-            self.old_last_wasm_exit_fp.get()
+        pub unsafe fn old_last_wasm_exit_fp(&self) -> usize {
+            (&*self.old_state).last_wasm_exit_fp
         }
 
         /// Get the saved PC upon exit from Wasm for the previous `CallThreadState`.
-        pub fn old_last_wasm_exit_pc(&self) -> usize {
-            self.old_last_wasm_exit_pc.get()
+        pub unsafe fn old_last_wasm_exit_pc(&self) -> usize {
+            (&*self.old_state).last_wasm_exit_pc
         }
 
         /// Get the saved FP upon entry into Wasm for the previous `CallThreadState`.
-        pub fn old_last_wasm_entry_fp(&self) -> usize {
-            self.old_last_wasm_entry_fp.get()
+        pub unsafe fn old_last_wasm_entry_fp(&self) -> usize {
+            (&*self.old_state).last_wasm_entry_fp
+        }
+
+        /// Get the saved `VMStackChain` for the previous `CallThreadState`.
+        pub unsafe fn old_stack_chain(&self) -> VMStackChain {
+            (&*self.old_state).stack_chain.clone()
         }
 
         /// Get the previous `CallThreadState`.
@@ -574,6 +574,38 @@ mod call_thread_state {
             let prev = self.prev.replace(ptr::null());
             let head = tls::raw::replace(prev);
             assert!(core::ptr::eq(head, self));
+        }
+
+        /// Swaps the state in this `CallThreadState`'s `VMStoreContext` with
+        /// the state in `EntryStoreContext` that was saved when this
+        /// activation was created.
+        ///
+        /// This method is using during suspension of a fiber to restore the
+        /// store back to what it originally was and prepare it to be resumed
+        /// later on. This takes various fields of `VMStoreContext` and swaps
+        /// them with what was saved in `EntryStoreContext`. That restores
+        /// a store to just before this activation was called but saves off the
+        /// fields of this activation to get restored/resumed at a later time.
+        #[cfg(feature = "async")]
+        pub(super) unsafe fn swap(&self) {
+            unsafe fn swap<T>(a: &core::cell::UnsafeCell<T>, b: &mut T) {
+                core::mem::swap(&mut *a.get(), b)
+            }
+
+            let cx = self.vm_store_context.as_ref();
+            swap(
+                &cx.last_wasm_exit_fp,
+                &mut (*self.old_state).last_wasm_exit_fp,
+            );
+            swap(
+                &cx.last_wasm_exit_pc,
+                &mut (*self.old_state).last_wasm_exit_pc,
+            );
+            swap(
+                &cx.last_wasm_entry_fp,
+                &mut (*self.old_state).last_wasm_entry_fp,
+            );
+            swap(&cx.stack_chain, &mut (*self.old_state).stack_chain);
         }
     }
 }
@@ -874,7 +906,6 @@ pub(crate) mod tls {
     // these functions are free to be inlined.
     pub(super) mod raw {
         use super::CallThreadState;
-        use sptr::Strict;
 
         pub type Ptr = *const CallThreadState;
 
@@ -884,7 +915,7 @@ pub(crate) mod tls {
 
         fn tls_get() -> (Ptr, bool) {
             let mut initialized = false;
-            let p = Strict::map_addr(crate::runtime::vm::sys::tls_get(), |a| {
+            let p = crate::runtime::vm::sys::tls_get().map_addr(|a| {
                 initialized = (a & 1) != 0;
                 a & !1
             });
@@ -892,7 +923,7 @@ pub(crate) mod tls {
         }
 
         fn tls_set(ptr: Ptr, initialized: bool) {
-            let encoded = Strict::map_addr(ptr, |a| a | usize::from(initialized));
+            let encoded = ptr.map_addr(|a| a | usize::from(initialized));
             crate::runtime::vm::sys::tls_set(encoded.cast_mut().cast::<u8>());
         }
 
@@ -978,10 +1009,28 @@ pub(crate) mod tls {
         /// that this doesn't push stale data and the data is popped
         /// appropriately.
         pub unsafe fn push(self) -> PreviousAsyncWasmCallState {
+            // First save the state of TLS as-is so when this state is popped
+            // off later on we know where to stop.
+            let ret = PreviousAsyncWasmCallState { state: raw::get() };
+
+            // The oldest activation, if present, has various `VMStoreContext`
+            // fields saved within it. These fields were the state for the
+            // *youngest* activation when a suspension previously happened. By
+            // swapping them back into the store this is an O(1) way of
+            // restoring the state of a store's metadata fields at the time of
+            // the suspension.
+            //
+            // The store's previous values before this function will all get
+            // saved in the oldest activation's state on the stack. The store's
+            // current state then describes the youngest activation which is
+            // restored via the loop below.
+            if let Some(state) = self.state.as_ref() {
+                state.swap();
+            }
+
             // Our `state` pointer is a linked list of oldest-to-youngest so by
             // pushing in order of the list we restore the youngest-to-oldest
             // list as stored in the state of this current thread.
-            let ret = PreviousAsyncWasmCallState { state: raw::get() };
             let mut ptr = self.state;
             while let Some(state) = ptr.as_ref() {
                 ptr = state.prev.replace(core::ptr::null_mut());
@@ -1041,16 +1090,37 @@ pub(crate) mod tls {
             loop {
                 // If the current TLS state is as we originally found it, then
                 // this loop is finished.
+                //
+                // Note, though, that before exiting, if the oldest
+                // `CallThreadState` is present, the current state of
+                // `VMStoreContext` is saved off within it. This will save the
+                // current state, before this function, of `VMStoreContext`
+                // into the `EntryStoreContext` stored with the oldest
+                // activation. This is a bit counter-intuitive where the state
+                // for the youngest activation is stored in the "old" state
+                // of the oldest activation.
+                //
+                // What this does is restores the state of the store to just
+                // before this async fiber was started. The fiber's state will
+                // be entirely self-contained in the fiber itself and the
+                // returned `AsyncWasmCallState`. Resumption above in
+                // `AsyncWasmCallState::push` will perform the swap back into
+                // the store to hook things up again.
                 let ptr = raw::get();
                 if ptr == thread_head {
+                    if let Some(state) = ret.state.as_ref() {
+                        state.swap();
+                    }
+
                     break ret;
                 }
 
                 // Pop this activation from the current thread's TLS state, and
                 // then afterwards push it onto our own linked list within this
-                // `AsyncWasmCallState`. Note that the linked list in `AsyncWasmCallState` is stored
-                // in reverse order so a subsequent `push` later on pushes
-                // everything in the right order.
+                // `AsyncWasmCallState`. Note that the linked list in
+                // `AsyncWasmCallState` is stored in reverse order so a
+                // subsequent `push` later on pushes everything in the right
+                // order.
                 (*ptr).pop();
                 if let Some(state) = ret.state.as_ref() {
                     (*ptr).prev.set(state);

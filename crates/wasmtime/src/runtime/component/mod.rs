@@ -104,6 +104,7 @@ mod component;
 #[cfg(feature = "component-model-async")]
 pub(crate) mod concurrent;
 mod func;
+mod has_data;
 mod instance;
 mod linker;
 mod matching;
@@ -116,11 +117,13 @@ mod values;
 pub use self::component::{Component, ComponentExportIndex};
 #[cfg(feature = "component-model-async")]
 pub use self::concurrent::{
-    ErrorContext, FutureReader, Promise, PromisesUnordered, StreamReader, VMComponentAsyncStore,
+    Access, Accessor, ErrorContext, FutureReader, FutureWriter, HostFuture, HostStream,
+    StreamReader, StreamWriter, VMComponentAsyncStore,
 };
 pub use self::func::{
     ComponentNamedList, ComponentType, Func, Lift, Lower, TypedFunc, WasmList, WasmStr,
 };
+pub use self::has_data::*;
 pub use self::instance::{Instance, InstanceExportLookup, InstancePre};
 pub use self::linker::{Linker, LinkerInstance};
 pub use self::resource_table::{ResourceTable, ResourceTableError};
@@ -128,7 +131,9 @@ pub use self::resources::{Resource, ResourceAny};
 pub use self::types::{ResourceType, Type};
 pub use self::values::Val;
 
+pub(crate) use self::instance::RuntimeImport;
 pub(crate) use self::resources::HostResourceData;
+pub(crate) use self::store::ComponentInstanceId;
 
 // Re-export wasm_wave crate so the compatible version of this dep doesn't have to be
 // tracked separately from wasmtime.
@@ -140,18 +145,19 @@ pub use wasm_wave;
 #[doc(hidden)]
 pub mod __internal {
     pub use super::func::{
-        bad_type_info, format_flags, lower_payload, typecheck_enum, typecheck_flags,
-        typecheck_record, typecheck_variant, ComponentVariant, LiftContext, LowerContext, Options,
+        ComponentVariant, LiftContext, LowerContext, Options, bad_type_info, format_flags,
+        lower_payload, typecheck_enum, typecheck_flags, typecheck_record, typecheck_variant,
     };
     pub use super::matching::InstanceType;
+    pub use crate::MaybeUninitExt;
     pub use crate::map_maybe_uninit;
     pub use crate::store::StoreOpaque;
-    pub use crate::MaybeUninitExt;
     pub use alloc::boxed::Box;
     pub use alloc::string::String;
     pub use alloc::vec::Vec;
     pub use anyhow;
     pub use core::cell::RefCell;
+    pub use core::future::Future;
     pub use core::mem::transmute;
     #[cfg(feature = "async")]
     pub use trait_variant::make as trait_variant_make;
@@ -352,13 +358,13 @@ pub(crate) use self::store::ComponentStoreData;
 ///         // This can be used to indicate that entire interfaces have
 ///         // bindings generated elsewhere with a path pointing to the
 ///         // bindinges-generated module.
-///         "wasi:random/random": wasmtime_wasi::bindings::random::random,
+///         "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
 ///
 ///         // Similarly entire packages can also be specified.
-///         "wasi:cli": wasmtime_wasi::bindings::cli,
+///         "wasi:cli": wasmtime_wasi::p2::bindings::cli,
 ///
 ///         // Or, if applicable, entire namespaces can additionally be mapped.
-///         "wasi": wasmtime_wasi::bindings,
+///         "wasi": wasmtime_wasi::p2::bindings,
 ///
 ///         // Versions are supported if multiple versions are in play:
 ///         "wasi:http/types@0.2.0": wasmtime_wasi_http::bindings::http::types,
@@ -675,3 +681,9 @@ pub mod bindgen_examples;
 #[cfg(not(any(docsrs, test, doctest)))]
 #[doc(hidden)]
 pub mod bindgen_examples {}
+
+#[cfg(not(feature = "component-model-async"))]
+pub(crate) mod concurrent_disabled;
+
+#[cfg(not(feature = "component-model-async"))]
+pub(crate) use concurrent_disabled as concurrent;

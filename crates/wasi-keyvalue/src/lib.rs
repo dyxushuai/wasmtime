@@ -20,7 +20,7 @@
 //!     component::{Linker, ResourceTable},
 //!     Config, Engine, Result, Store,
 //! };
-//! use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
+//! use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 //! use wasmtime_wasi_keyvalue::{WasiKeyValue, WasiKeyValueCtx, WasiKeyValueCtxBuilder};
 //!
 //! #[tokio::main]
@@ -36,7 +36,7 @@
 //!     });
 //!
 //!     let mut linker = Linker::<Ctx>::new(&engine);
-//!     wasmtime_wasi::add_to_linker_async(&mut linker)?;
+//!     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 //!     // add `wasi-keyvalue` world's interfaces to the linker
 //!     wasmtime_wasi_keyvalue::add_to_linker(&mut linker, |h: &mut Ctx| {
 //!         WasiKeyValue::new(&h.wasi_keyvalue_ctx, &mut h.table)
@@ -84,7 +84,7 @@ mod generated {
 use self::generated::wasi::keyvalue;
 use anyhow::Result;
 use std::collections::HashMap;
-use wasmtime::component::{Resource, ResourceTable, ResourceTableError};
+use wasmtime::component::{HasData, Resource, ResourceTable, ResourceTableError};
 
 #[doc(hidden)]
 pub enum Error {
@@ -288,12 +288,18 @@ impl keyvalue::batch::Host for WasiKeyValue<'_> {
 }
 
 /// Add all the `wasi-keyvalue` world's interfaces to a [`wasmtime::component::Linker`].
-pub fn add_to_linker<T: Send>(
+pub fn add_to_linker<T: Send + 'static>(
     l: &mut wasmtime::component::Linker<T>,
-    f: impl Fn(&mut T) -> WasiKeyValue<'_> + Send + Sync + Copy + 'static,
+    f: fn(&mut T) -> WasiKeyValue<'_>,
 ) -> Result<()> {
-    keyvalue::store::add_to_linker_get_host(l, f)?;
-    keyvalue::atomics::add_to_linker_get_host(l, f)?;
-    keyvalue::batch::add_to_linker_get_host(l, f)?;
+    keyvalue::store::add_to_linker::<_, HasWasiKeyValue>(l, f)?;
+    keyvalue::atomics::add_to_linker::<_, HasWasiKeyValue>(l, f)?;
+    keyvalue::batch::add_to_linker::<_, HasWasiKeyValue>(l, f)?;
     Ok(())
+}
+
+struct HasWasiKeyValue;
+
+impl HasData for HasWasiKeyValue {
+    type Data<'a> = WasiKeyValue<'a>;
 }

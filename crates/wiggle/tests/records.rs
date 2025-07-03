@@ -1,9 +1,9 @@
 use proptest::prelude::*;
 use wiggle::{GuestMemory, GuestPtr};
-use wiggle_test::{impl_errno, HostMemory, MemArea, MemAreas, WasiCtx};
+use wiggle_test::{HostMemory, MemArea, MemAreas, WasiCtx, impl_errno};
 
 wiggle::from_witx!({
-    witx: ["$CARGO_MANIFEST_DIR/tests/records.witx"],
+    witx: ["tests/records.witx"],
 });
 
 impl_errno!(types::Errno);
@@ -59,10 +59,7 @@ impl<'a> records::Records for WasiCtx<'a> {
         first: GuestPtr<i32>,
         second: GuestPtr<i32>,
     ) -> Result<types::PairIntPtrs, types::Errno> {
-        Ok(types::PairIntPtrs {
-            first: first,
-            second: second,
-        })
+        Ok(types::PairIntPtrs { first, second })
     }
 
     fn sum_array(

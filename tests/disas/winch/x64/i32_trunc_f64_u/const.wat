@@ -14,36 +14,34 @@
 ;;       movq    0x10(%r11), %r11
 ;;       addq    $0x10, %r11
 ;;       cmpq    %rsp, %r11
-;;       ja      0x84
+;;       ja      0x89
 ;;   1c: movq    %rdi, %r14
 ;;       subq    $0x10, %rsp
 ;;       movq    %rdi, 8(%rsp)
 ;;       movq    %rsi, (%rsp)
-;;       movsd   0x5c(%rip), %xmm1
+;;       movsd   0x59(%rip), %xmm1
 ;;       movabsq $0x41e0000000000000, %r11
 ;;       movq    %r11, %xmm15
 ;;       ucomisd %xmm15, %xmm1
-;;       jae     0x63
-;;       jp      0x86
-;;   54: cvttsd2si %xmm1, %eax
+;;       jae     0x66
+;;       jp      0x8b
+;;   57: cvttsd2si %xmm1, %eax
 ;;       cmpl    $0, %eax
-;;       jge     0x7e
-;;   61: ud2
+;;       jge     0x80
+;;   64: ud2
 ;;       movaps  %xmm1, %xmm0
 ;;       subsd   %xmm15, %xmm0
 ;;       cvttsd2si %xmm0, %eax
 ;;       cmpl    $0, %eax
-;;       jl      0x88
-;;   78: addl    $0x80000000, %eax
+;;       jl      0x8d
+;;   7b: addl    $0x80000000, %eax
 ;;       addq    $0x10, %rsp
 ;;       popq    %rbp
 ;;       retq
-;;   84: ud2
-;;   86: ud2
-;;   88: ud2
-;;   8a: addb    %al, (%rax)
-;;   8c: addb    %al, (%rax)
-;;   8e: addb    %al, (%rax)
-;;   90: addb    %al, (%rax)
-;;   92: addb    %al, (%rax)
-;;   94: addb    %al, (%rax)
+;;   89: ud2
+;;   8b: ud2
+;;   8d: ud2
+;;   8f: addb    %al, (%rax)
+;;   91: addb    %al, (%rax)
+;;   93: addb    %al, (%rax)
+;;   95: addb    %dh, %al

@@ -42,7 +42,7 @@
 
 use crate::runtime::module::lookup_code;
 use crate::runtime::vm::sys::traphandlers::wasmtime_longjmp;
-use crate::runtime::vm::traphandlers::{tls, TrapRegisters};
+use crate::runtime::vm::traphandlers::{TrapRegisters, tls};
 use mach2::exc::*;
 use mach2::exception_types::*;
 use mach2::kern_return::*;
@@ -140,9 +140,8 @@ unsafe extern "C" fn sigbus_handler(
             None => return,
         };
         let faulting_addr = (*siginfo).si_addr() as usize;
-        let start = info.async_guard_range.start;
-        let end = info.async_guard_range.end;
-        if start as usize <= faulting_addr && faulting_addr < end as usize {
+        let range = &info.vm_store_context.as_ref().async_guard_range;
+        if range.start.addr() <= faulting_addr && faulting_addr < range.end.addr() {
             super::signals::abort_stack_overflow();
         }
     });

@@ -2,10 +2,9 @@ use {
     proc_macro2::{Span, TokenStream},
     std::{collections::HashMap, path::PathBuf},
     syn::{
-        braced, bracketed,
+        Error, Ident, LitStr, Result, Token, braced, bracketed,
         parse::{Parse, ParseStream},
         punctuated::Punctuated,
-        Error, Ident, LitStr, Result, Token,
     },
 };
 
@@ -252,11 +251,7 @@ impl Parse for Paths {
         let expanded_paths = path_lits
             .iter()
             .map(|lit| {
-                PathBuf::from(
-                    shellexpand::env(&lit.value())
-                        .expect("shell expansion")
-                        .as_ref(),
-                )
+                PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join(lit.value())
             })
             .collect::<Vec<PathBuf>>();
 
@@ -304,10 +299,11 @@ impl Parse for ErrorConf {
                     return Err(Error::new(
                         *i.err_loc(),
                         format!(
-                        "duplicate definition of rich error type for {:?}: previously defined at {:?}",
-                        i.abi_error(), prev_def.err_loc(),
-                    ),
-                    ))
+                            "duplicate definition of rich error type for {:?}: previously defined at {:?}",
+                            i.abi_error(),
+                            prev_def.err_loc(),
+                        ),
+                    ));
                 }
             }
         }

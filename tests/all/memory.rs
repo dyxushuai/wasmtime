@@ -114,8 +114,8 @@ fn offsets_static_dynamic_oh_my(config: &mut Config) -> Result<()> {
         }
     }
 
-    engines.par_iter().for_each(|engine| {
-        let module = module(&engine).unwrap();
+    engines.par_iter().try_for_each(|engine| {
+        let module = module(&engine)?;
 
         for (min, max) in [(1, Some(2)), (1, None)].iter() {
             let mut store = Store::new(&engine, ());
@@ -133,7 +133,8 @@ fn offsets_static_dynamic_oh_my(config: &mut Config) -> Result<()> {
             test_traps(&mut store, &funcs, 65536, &mem);
             test_traps(&mut store, &funcs, u32::MAX, &mem);
         }
-    });
+        Ok::<_, wasmtime::Error>(())
+    })?;
 
     Ok(())
 }
@@ -249,6 +250,7 @@ fn guards_present_pooling(config: &mut Config) -> Result<()> {
 #[wasmtime_test]
 #[cfg_attr(miri, ignore)]
 #[cfg_attr(asan, ignore)]
+#[cfg(target_arch = "x86_64")] // only platform with mpk
 fn guards_present_pooling_mpk(config: &mut Config) -> Result<()> {
     if !wasmtime::PoolingAllocationConfig::are_memory_protection_keys_available() {
         println!("skipping `guards_present_pooling_mpk` test; mpk is not supported");
@@ -511,11 +513,13 @@ fn memory64_maximum_minimum(config: &mut Config) -> Result<()> {
     let engine = Engine::new(&config)?;
     let mut store = Store::new(&engine, ());
 
-    assert!(MemoryTypeBuilder::default()
-        .memory64(true)
-        .min(1 << 48)
-        .build()
-        .is_err());
+    assert!(
+        MemoryTypeBuilder::default()
+            .memory64(true)
+            .min(1 << 48)
+            .build()
+            .is_err()
+    );
 
     let module = Module::new(
         &engine,
@@ -567,12 +571,14 @@ fn shared_memory_basics() -> Result<()> {
     assert!(SharedMemory::new(&engine, MemoryType::new(1, Some(1))).is_err());
     assert!(SharedMemory::new(&engine, MemoryType::new64(1, None)).is_err());
     assert!(SharedMemory::new(&engine, MemoryType::new64(1, Some(1))).is_err());
-    assert!(MemoryTypeBuilder::default()
-        .shared(true)
-        .min(1)
-        .max(Some(0))
-        .build()
-        .is_err());
+    assert!(
+        MemoryTypeBuilder::default()
+            .shared(true)
+            .min(1)
+            .max(Some(0))
+            .build()
+            .is_err()
+    );
 
     let memory = SharedMemory::new(&engine, MemoryType::shared(1, 1))?;
     assert!(memory.ty().is_shared());
@@ -671,8 +677,8 @@ fn shared_memory_wait_notify() -> Result<()> {
 #[wasmtime_test]
 #[cfg_attr(miri, ignore)]
 #[cfg(target_pointer_width = "64")] // requires large VM reservation
-fn init_with_negative_segment(_: &mut Config) -> Result<()> {
-    let engine = Engine::default();
+fn init_with_negative_segment(cfg: &mut Config) -> Result<()> {
+    let engine = Engine::new(cfg)?;
     let module = Module::new(
         &engine,
         r#"

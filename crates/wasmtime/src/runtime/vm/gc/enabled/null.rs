@@ -6,23 +6,19 @@
 
 use super::*;
 use crate::{
+    Engine,
     prelude::*,
     vm::{
         ExternRefHostDataId, ExternRefHostDataTable, GarbageCollection, GcHeap, GcHeapObject,
         GcProgress, GcRootsIter, GcRuntime, SendSyncUnsafeCell, TypedGcRef, VMGcHeader, VMGcRef,
         VMMemoryDefinition,
     },
-    Engine,
 };
 use core::ptr::NonNull;
-use core::{
-    alloc::Layout,
-    any::Any,
-    num::{NonZeroU32, NonZeroUsize},
-};
+use core::{alloc::Layout, any::Any, num::NonZeroU32};
 use wasmtime_environ::{
-    null::NullTypeLayouts, GcArrayLayout, GcStructLayout, GcTypeLayouts, VMGcKind,
-    VMSharedTypeIndex,
+    GcArrayLayout, GcStructLayout, GcTypeLayouts, VMGcKind, VMSharedTypeIndex,
+    null::NullTypeLayouts,
 };
 
 /// The null collector.
@@ -253,11 +249,6 @@ unsafe impl GcHeap for NullHeap {
 
     fn expose_gc_ref_to_wasm(&mut self, _gc_ref: VMGcRef) {
         // Don't need to do anything special here.
-    }
-
-    fn need_gc_before_entering_wasm(&self, _num_gc_refs: NonZeroUsize) -> bool {
-        // Never need to GC before entering Wasm.
-        false
     }
 
     fn alloc_externref(

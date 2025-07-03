@@ -195,8 +195,7 @@
 //!
 //! * `cache` - Enabled by default, this feature adds support for wasmtime to
 //!   perform internal caching of modules in a global location. This must still
-//!   be enabled explicitly through [`Config::cache_config_load`] or
-//!   [`Config::cache_config_load_default`].
+//!   be enabled explicitly through [`Config::cache`].
 //!
 //! * `wat` - Enabled by default, this feature adds support for accepting the
 //!   text format of WebAssembly in [`Module::new`] and
@@ -296,14 +295,14 @@
 #![expect(clippy::allow_attributes_without_reason, reason = "crate not migrated")]
 #![expect(unsafe_op_in_unsafe_fn, reason = "crate isn't migrated yet")]
 
-#[cfg(any(feature = "std", unix, windows))]
+#[cfg(feature = "std")]
 #[macro_use]
 extern crate std;
 extern crate alloc;
 
 pub(crate) mod prelude {
     pub use crate::{Error, Result};
-    pub use anyhow::{anyhow, bail, ensure, format_err, Context};
+    pub use anyhow::{Context, anyhow, bail, ensure, format_err};
     pub use wasmtime_environ::prelude::*;
 }
 
@@ -357,7 +356,7 @@ pub trait MaybeUninitExt<T> {
     /// Note that this is `unsafe` as there is no guarantee that `U` comes from
     /// `T`.
     unsafe fn map<U>(&mut self, f: impl FnOnce(*mut T) -> *mut U)
-        -> &mut core::mem::MaybeUninit<U>;
+    -> &mut core::mem::MaybeUninit<U>;
 }
 
 impl<T> MaybeUninitExt<T> for core::mem::MaybeUninit<T> {

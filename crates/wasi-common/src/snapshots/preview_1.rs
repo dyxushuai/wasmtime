@@ -1,14 +1,14 @@
 use crate::{
+    I32Exit, SystemTimeSpec, WasiCtx,
     dir::{DirEntry, OpenResult, ReaddirCursor, ReaddirEntity, TableDirExt},
     file::{
         Advice, FdFlags, FdStat, FileAccessMode, FileEntry, FileType, Filestat, OFlags, RiFlags,
         RoFlags, SdFlags, SiFlags, TableFileExt, WasiFile,
     },
     sched::{
-        subscription::{RwEventFlags, SubscriptionResult},
         Poll, Userdata,
+        subscription::{RwEventFlags, SubscriptionResult},
     },
-    I32Exit, SystemTimeSpec, WasiCtx,
 };
 use cap_std::time::{Duration, SystemClock};
 use std::borrow::Cow;
@@ -26,7 +26,7 @@ use error::{Error, ErrorExt};
 pub(crate) const MAX_SHARED_BUFFER_SIZE: usize = 1 << 16;
 
 wiggle::from_witx!({
-    witx: ["$CARGO_MANIFEST_DIR/witx/preview1/wasi_snapshot_preview1.witx"],
+    witx: ["witx/preview1/wasi_snapshot_preview1.witx"],
     errors: { errno => trappable Error },
     // Note: not every function actually needs to be async, however, nearly all of them do, and
     // keeping that set the same in this macro and the wasmtime_wiggle / lucet_wiggle macros is
@@ -228,7 +228,9 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiCtx {
                 .set_fdflags(FdFlags::from(flags))
                 .await
         } else {
-            log::warn!("`fd_fdstat_set_flags` does not work with wasi-threads enabled; see https://github.com/bytecodealliance/wasmtime/issues/5643");
+            log::warn!(
+                "`fd_fdstat_set_flags` does not work with wasi-threads enabled; see https://github.com/bytecodealliance/wasmtime/issues/5643"
+            );
             Err(Error::not_supported())
         }
     }

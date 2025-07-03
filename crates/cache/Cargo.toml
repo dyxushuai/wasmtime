@@ -1,8 +1,8 @@
 [package]
-name = "wasmtime-cache"
+name = "wasmtime-internal-cache"
 version.workspace = true
 authors.workspace = true
-description = "Support for automatic module caching with Wasmtime"
+description = "INTERNAL: Support for automatic module caching with Wasmtime"
 license = "Apache-2.0 WITH LLVM-exception"
 repository = "https://github.com/bytecodealliance/wasmtime"
 documentation = "https://docs.rs/wasmtime-cache/"
@@ -35,5 +35,5 @@ rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 filetime = "0.2.7"
-pretty_env_logger = { workspace = true }
+env_logger = { workspace = true }
 tempfile = "3"

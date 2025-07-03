@@ -1,6 +1,6 @@
 //! Raw bindings to the `wasi:http` package.
 
-#[allow(missing_docs)]
+#[expect(missing_docs, reason = "bindgen-generated code")]
 mod generated {
     use crate::body;
     use crate::types;
@@ -19,7 +19,7 @@ mod generated {
         require_store_data_send: true,
         with: {
             // Upstream package dependencies
-            "wasi:io": wasmtime_wasi::bindings::io,
+            "wasi:io": wasmtime_wasi::p2::bindings::io,
 
             // Configure all WIT http resources to be defined types in this
             // crate to use the `ResourceTable` helper methods.
@@ -47,13 +47,12 @@ pub use self::generated::wasi::*;
 pub use self::generated::exports;
 
 /// Bindings to the `wasi:http/proxy` world.
-pub use self::generated::{Proxy, ProxyIndices, ProxyPre};
+pub use self::generated::{LinkOptions, Proxy, ProxyIndices, ProxyPre};
 
 /// Sync implementation of the `wasi:http/proxy` world.
 pub mod sync {
-    #[allow(missing_docs)]
+    #[expect(missing_docs, reason = "bindgen-generated code")]
     mod generated {
-        #![allow(missing_docs)]
         wasmtime::component::bindgen!({
             world: "wasi:http/proxy",
             tracing: true,
@@ -63,7 +62,7 @@ pub mod sync {
                 "wasi:http": crate::bindings::http,
                 // sync requires the wrapper in the wasmtime_wasi crate, in
                 // order to have in_tokio
-                "wasi:io": wasmtime_wasi::bindings::sync::io,
+                "wasi:io": wasmtime_wasi::p2::bindings::sync::io,
             },
             require_store_data_send: true,
         });

@@ -35,20 +35,28 @@ fn instance_exports() -> Result<()> {
         .module("m", &Module::new(&engine, "(module)")?)?;
     let instance = linker.instantiate(&mut store, &component)?;
 
-    assert!(instance
-        .get_export(&mut store, None, "not an instance")
-        .is_none());
-    let i = instance.get_export(&mut store, None, "r").unwrap();
+    assert!(
+        instance
+            .get_export(&mut store, None, "not an instance")
+            .is_none()
+    );
+    let i = instance.get_export_index(&mut store, None, "r").unwrap();
     assert!(instance.get_export(&mut store, Some(&i), "x").is_none());
     instance.get_export(&mut store, None, "i").unwrap();
-    let i2 = instance.get_export(&mut store, None, "r2").unwrap();
-    let m = instance.get_export(&mut store, Some(&i2), "m").unwrap();
+    let i2 = instance.get_export_index(&mut store, None, "r2").unwrap();
+    let m = instance
+        .get_export_index(&mut store, Some(&i2), "m")
+        .unwrap();
     assert!(instance.get_func(&mut store, &m).is_none());
     assert!(instance.get_module(&mut store, &m).is_some());
 
-    let i = instance.get_export(&mut store, None, "i").unwrap();
-    let i = instance.get_export(&mut store, Some(&i), "i").unwrap();
-    let m = instance.get_export(&mut store, Some(&i), "m").unwrap();
+    let i = instance.get_export_index(&mut store, None, "i").unwrap();
+    let i = instance
+        .get_export_index(&mut store, Some(&i), "i")
+        .unwrap();
+    let m = instance
+        .get_export_index(&mut store, Some(&i), "m")
+        .unwrap();
     instance.get_module(&mut store, &m).unwrap();
 
     Ok(())
@@ -68,9 +76,9 @@ fn export_old_get_new() -> Result<()> {
     "#;
 
     let component = Component::new(&engine, component)?;
-    component.export_index(None, "a:b/m@1.0.1").unwrap();
-    let (_, i) = component.export_index(None, "a:b/i@1.0.1").unwrap();
-    component.export_index(Some(&i), "m").unwrap();
+    component.get_export(None, "a:b/m@1.0.1").unwrap();
+    let i = component.get_export_index(None, "a:b/i@1.0.1").unwrap();
+    component.get_export(Some(&i), "m").unwrap();
 
     let mut store = Store::new(&engine, ());
     let linker = Linker::new(&engine);
@@ -82,7 +90,7 @@ fn export_old_get_new() -> Result<()> {
         .unwrap();
 
     let i = instance
-        .get_export(&mut store, None, "a:b/i@1.0.1")
+        .get_export_index(&mut store, None, "a:b/i@1.0.1")
         .unwrap();
     instance.get_export(&mut store, Some(&i), "m").unwrap();
 
@@ -103,9 +111,9 @@ fn export_new_get_old() -> Result<()> {
     "#;
 
     let component = Component::new(&engine, component)?;
-    component.export_index(None, "a:b/m@1.0.0").unwrap();
-    let (_, i) = component.export_index(None, "a:b/i@1.0.0").unwrap();
-    component.export_index(Some(&i), "m").unwrap();
+    component.get_export(None, "a:b/m@1.0.0").unwrap();
+    let i = component.get_export_index(None, "a:b/i@1.0.0").unwrap();
+    component.get_export(Some(&i), "m").unwrap();
 
     let mut store = Store::new(&engine, ());
     let linker = Linker::new(&engine);
@@ -117,7 +125,7 @@ fn export_new_get_old() -> Result<()> {
         .unwrap();
 
     let i = instance
-        .get_export(&mut store, None, "a:b/i@1.0.0")
+        .get_export_index(&mut store, None, "a:b/i@1.0.0")
         .unwrap();
     instance.get_export(&mut store, Some(&i), "m").unwrap();
 
@@ -158,14 +166,14 @@ fn export_missing_get_max() -> Result<()> {
 
     for (name, test_fn) in tests {
         println!("test {name}");
-        let (_, m) = component.export_index(None, name).unwrap();
+        let m = component.get_export_index(None, name).unwrap();
         let m = instance.get_module(&mut store, &m).unwrap();
         test_fn(&m);
 
         let m = instance.get_module(&mut store, name).unwrap();
         test_fn(&m);
 
-        let m = instance.get_export(&mut store, None, name).unwrap();
+        let m = instance.get_export_index(&mut store, None, name).unwrap();
         let m = instance.get_module(&mut store, &m).unwrap();
         test_fn(&m);
     }

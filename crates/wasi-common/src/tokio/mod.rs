@@ -7,7 +7,7 @@ pub mod stdio;
 use self::sched::sched_ctx;
 use crate::sync::net::Socket;
 pub use crate::sync::{clocks_ctx, random_ctx};
-use crate::{file::FileAccessMode, Error, Table, WasiCtx, WasiFile};
+use crate::{Error, Table, WasiCtx, WasiFile, file::FileAccessMode};
 pub use dir::Dir;
 pub use file::File;
 pub use net::*;
@@ -113,7 +113,7 @@ impl WasiCtxBuilder {
 }
 
 // Much of this mod is implemented in terms of `async` methods from the
-// wasmtime_wasi::sync module. These methods may be async in signature, however,
+// wasmtime_wasi::p2::sync module. These methods may be async in signature, however,
 // they are synchronous in implementation (always Poll::Ready on first poll)
 // and perform blocking syscalls.
 //

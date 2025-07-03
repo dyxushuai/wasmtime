@@ -1,6 +1,6 @@
 use super::invoke_wasm_and_catch_traps;
 use crate::prelude::*;
-use crate::runtime::vm::{VMFuncRef, VMOpaqueContext};
+use crate::runtime::vm::VMFuncRef;
 use crate::store::{AutoAssertNoGc, StoreOpaque};
 use crate::{
     AsContext, AsContextMut, Engine, Func, FuncType, HeapType, NoFunc, RefType, StoreContextMut,
@@ -93,17 +93,13 @@ where
     /// connected to an asynchronous store.
     ///
     /// [`Trap`]: crate::Trap
+    #[inline]
     pub fn call(&self, mut store: impl AsContextMut, params: Params) -> Result<Results> {
         let mut store = store.as_context_mut();
         assert!(
             !store.0.async_support(),
             "must use `call_async` with async stores"
         );
-
-        #[cfg(feature = "gc")]
-        if Self::need_gc_before_call_raw(store.0, &params) {
-            store.gc(None);
-        }
 
         let func = self.func.vm_func_ref(store.0);
         unsafe { Self::call_raw(&mut store, &self.ty, func, params) }
@@ -127,24 +123,20 @@ where
     ///
     /// [`Trap`]: crate::Trap
     #[cfg(feature = "async")]
-    pub async fn call_async<T>(
+    pub async fn call_async(
         &self,
-        mut store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data: Send>,
         params: Params,
     ) -> Result<Results>
     where
-        T: Send,
+        Params: Sync,
+        Results: Sync,
     {
         let mut store = store.as_context_mut();
         assert!(
             store.0.async_support(),
             "must use `call` with non-async stores"
         );
-
-        #[cfg(feature = "gc")]
-        if Self::need_gc_before_call_raw(store.0, &params) {
-            store.gc_async(None).await?;
-        }
 
         store
             .on_fiber(|store| {
@@ -154,31 +146,11 @@ where
             .await?
     }
 
-    #[inline]
-    #[cfg(feature = "gc")]
-    pub(crate) fn need_gc_before_call_raw(_store: &StoreOpaque, _params: &Params) -> bool {
-        {
-            // See the comment in `Func::call_impl_check_args`.
-            let num_gc_refs = _params.vmgcref_pointing_to_object_count();
-            if let Some(num_gc_refs) = core::num::NonZeroUsize::new(num_gc_refs) {
-                return _store
-                    .unwrap_gc_store()
-                    .gc_heap
-                    .need_gc_before_entering_wasm(num_gc_refs);
-            }
-        }
-
-        false
-    }
-
     /// Do a raw call of a typed function.
     ///
     /// # Safety
     ///
     /// `func` must be of the given type.
-    ///
-    /// If `Self::need_gc_before_call_raw`, then the caller must have done a GC
-    /// just before calling this method.
     pub(crate) unsafe fn call_raw<T>(
         store: &mut StoreContextMut<'_, T>,
         ty: &FuncType,
@@ -223,9 +195,7 @@ where
             let storage = storage.cast::<ValRaw>();
             let storage = core::ptr::slice_from_raw_parts_mut(storage, storage_len);
             let storage = NonNull::new(storage).unwrap();
-            func_ref
-                .as_ref()
-                .array_call(vm, VMOpaqueContext::from_vmcontext(caller), storage)
+            VMFuncRef::array_call(*func_ref, vm, caller, storage)
         });
 
         let (_, storage) = captures;
@@ -548,7 +518,7 @@ unsafe impl WasmTy for Func {
 
     #[inline]
     fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
-        store.store_data().contains(self.0)
+        self.store == store.id()
     }
 
     #[inline]
@@ -586,7 +556,7 @@ unsafe impl WasmTy for Option<Func> {
     #[inline]
     fn compatible_with_store(&self, store: &StoreOpaque) -> bool {
         if let Some(f) = self {
-            store.store_data().contains(f.0)
+            f.compatible_with_store(store)
         } else {
             true
         }
@@ -605,7 +575,9 @@ unsafe impl WasmTy for Option<Func> {
         } else if nullable {
             Ok(())
         } else {
-            bail!("argument type mismatch: expected non-nullable (ref {expected}), found null reference")
+            bail!(
+                "argument type mismatch: expected non-nullable (ref {expected}), found null reference"
+            )
         }
     }
 

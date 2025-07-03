@@ -5,13 +5,14 @@ use crate::{Engine, ExternType, FuncType};
 use alloc::sync::Arc;
 use core::fmt;
 use core::ops::Deref;
-use wasmtime_environ::component::{
-    ComponentTypes, InterfaceType, ResourceIndex, TypeComponentIndex, TypeComponentInstanceIndex,
-    TypeDef, TypeEnumIndex, TypeFlagsIndex, TypeFuncIndex, TypeListIndex, TypeModuleIndex,
-    TypeOptionIndex, TypeRecordIndex, TypeResourceTableIndex, TypeResultIndex, TypeTupleIndex,
-    TypeVariantIndex,
-};
 use wasmtime_environ::PrimaryMap;
+use wasmtime_environ::component::{
+    ComponentTypes, Export, InterfaceType, ResourceIndex, TypeComponentIndex,
+    TypeComponentInstanceIndex, TypeDef, TypeEnumIndex, TypeFlagsIndex, TypeFuncIndex,
+    TypeFutureIndex, TypeFutureTableIndex, TypeListIndex, TypeModuleIndex, TypeOptionIndex,
+    TypeRecordIndex, TypeResourceTableIndex, TypeResultIndex, TypeStreamIndex,
+    TypeStreamTableIndex, TypeTupleIndex, TypeVariantIndex,
+};
 
 pub use crate::component::resources::ResourceType;
 
@@ -145,9 +146,16 @@ impl TypeChecker<'_> {
             (InterfaceType::String, _) => false,
             (InterfaceType::Char, InterfaceType::Char) => true,
             (InterfaceType::Char, _) => false,
-            (InterfaceType::Future(_), _)
-            | (InterfaceType::Stream(_), _)
-            | (InterfaceType::ErrorContext(_), _) => todo!(),
+            (InterfaceType::Future(t1), InterfaceType::Future(t2)) => {
+                self.future_table_types_equal(t1, t2)
+            }
+            (InterfaceType::Future(_), _) => false,
+            (InterfaceType::Stream(t1), InterfaceType::Stream(t2)) => {
+                self.stream_table_types_equal(t1, t2)
+            }
+            (InterfaceType::Stream(_), _) => false,
+            (InterfaceType::ErrorContext(_), InterfaceType::ErrorContext(_)) => true,
+            (InterfaceType::ErrorContext(_), _) => false,
         }
     }
 
@@ -246,6 +254,34 @@ impl TypeChecker<'_> {
         let a = &self.a_types[f1];
         let b = &self.b_types[f2];
         a.names == b.names
+    }
+
+    fn future_table_types_equal(&self, t1: TypeFutureTableIndex, t2: TypeFutureTableIndex) -> bool {
+        self.futures_equal(self.a_types[t1].ty, self.b_types[t2].ty)
+    }
+
+    fn futures_equal(&self, t1: TypeFutureIndex, t2: TypeFutureIndex) -> bool {
+        let a = &self.a_types[t1];
+        let b = &self.b_types[t2];
+        match (a.payload, b.payload) {
+            (Some(t1), Some(t2)) => self.interface_types_equal(t1, t2),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn stream_table_types_equal(&self, t1: TypeStreamTableIndex, t2: TypeStreamTableIndex) -> bool {
+        self.streams_equal(self.a_types[t1].ty, self.b_types[t2].ty)
+    }
+
+    fn streams_equal(&self, t1: TypeStreamIndex, t2: TypeStreamIndex) -> bool {
+        let a = &self.a_types[t1];
+        let b = &self.b_types[t2];
+        match (a.payload, b.payload) {
+            (Some(t1), Some(t2)) => self.interface_types_equal(t1, t2),
+            (None, None) => true,
+            _ => false,
+        }
     }
 }
 
@@ -351,12 +387,12 @@ impl Variant {
     }
 
     /// Retrieve the cases of this `variant` in declaration order.
-    pub fn cases(&self) -> impl ExactSizeIterator<Item = Case> {
+    pub fn cases(&self) -> impl ExactSizeIterator<Item = Case<'_>> {
         self.0.types[self.0.index]
             .cases
             .iter()
             .map(|(name, ty)| Case {
-                name: name,
+                name,
                 ty: ty.as_ref().map(|ty| Type::from(ty, &self.0.instance())),
             })
     }
@@ -419,7 +455,7 @@ impl PartialEq for OptionType {
 
 impl Eq for OptionType {}
 
-/// An `expected` interface type
+/// A `result` interface type
 #[derive(Clone, Debug)]
 pub struct ResultType(Handle<TypeResultIndex>);
 
@@ -479,6 +515,58 @@ impl PartialEq for Flags {
 
 impl Eq for Flags {}
 
+/// An `future` interface type
+#[derive(Clone, Debug)]
+pub struct FutureType(Handle<TypeFutureIndex>);
+
+impl FutureType {
+    pub(crate) fn from(index: TypeFutureIndex, ty: &InstanceType<'_>) -> Self {
+        FutureType(Handle::new(index, ty))
+    }
+
+    /// Retrieve the type parameter for this `future`.
+    pub fn ty(&self) -> Option<Type> {
+        Some(Type::from(
+            self.0.types[self.0.index].payload.as_ref()?,
+            &self.0.instance(),
+        ))
+    }
+}
+
+impl PartialEq for FutureType {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.equivalent(&other.0, TypeChecker::futures_equal)
+    }
+}
+
+impl Eq for FutureType {}
+
+/// An `stream` interface type
+#[derive(Clone, Debug)]
+pub struct StreamType(Handle<TypeStreamIndex>);
+
+impl StreamType {
+    pub(crate) fn from(index: TypeStreamIndex, ty: &InstanceType<'_>) -> Self {
+        StreamType(Handle::new(index, ty))
+    }
+
+    /// Retrieve the type parameter for this `stream`.
+    pub fn ty(&self) -> Option<Type> {
+        Some(Type::from(
+            self.0.types[self.0.index].payload.as_ref()?,
+            &self.0.instance(),
+        ))
+    }
+}
+
+impl PartialEq for StreamType {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.equivalent(&other.0, TypeChecker::streams_equal)
+    }
+}
+
+impl Eq for StreamType {}
+
 /// Represents a component model interface type
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[allow(missing_docs)]
@@ -506,6 +594,9 @@ pub enum Type {
     Flags(Flags),
     Own(ResourceType),
     Borrow(ResourceType),
+    Future(FutureType),
+    Stream(StreamType),
+    ErrorContext,
 }
 
 impl Type {
@@ -663,9 +754,9 @@ impl Type {
             InterfaceType::Flags(index) => Type::Flags(Flags::from(*index, instance)),
             InterfaceType::Own(index) => Type::Own(instance.resource_type(*index)),
             InterfaceType::Borrow(index) => Type::Borrow(instance.resource_type(*index)),
-            InterfaceType::Future(_)
-            | InterfaceType::Stream(_)
-            | InterfaceType::ErrorContext(_) => todo!(),
+            InterfaceType::Future(index) => Type::Future(instance.future_type(*index)),
+            InterfaceType::Stream(index) => Type::Stream(instance.stream_type(*index)),
+            InterfaceType::ErrorContext(_) => Type::ErrorContext,
         }
     }
 
@@ -694,6 +785,9 @@ impl Type {
             Type::Flags(_) => "flags",
             Type::Own(_) => "own",
             Type::Borrow(_) => "borrow",
+            Type::Future(_) => "future",
+            Type::Stream(_) => "stream",
+            Type::ErrorContext => "error-context",
         }
     }
 }
@@ -724,6 +818,18 @@ impl ComponentFunc {
             .types
             .iter()
             .map(|ty| Type::from(ty, &self.0.instance()))
+    }
+
+    #[doc(hidden)]
+    pub fn typecheck<Params, Return>(&self, cx: &InstanceType) -> anyhow::Result<()>
+    where
+        Params: crate::component::ComponentNamedList + crate::component::Lower,
+        Return: crate::component::ComponentNamedList + crate::component::Lift,
+    {
+        let ty = &self.0.types[self.0.index];
+        Params::typecheck(&InterfaceType::Tuple(ty.params), cx)?;
+        Return::typecheck(&InterfaceType::Tuple(ty.results), cx)?;
+        Ok(())
     }
 }
 
@@ -816,6 +922,14 @@ impl Component {
             )
         })
     }
+
+    #[doc(hidden)]
+    pub fn instance_type(&self) -> InstanceType<'_> {
+        InstanceType {
+            types: &self.0.types,
+            resources: &self.0.resources,
+        }
+    }
 }
 
 /// Component instance type
@@ -899,6 +1013,20 @@ impl ComponentItem {
                 };
                 Self::Resource(ty)
             }
+        }
+    }
+    pub(crate) fn from_export(engine: &Engine, export: &Export, ty: &InstanceType<'_>) -> Self {
+        match export {
+            Export::Instance { ty: idx, .. } => {
+                Self::ComponentInstance(ComponentInstance::from(*idx, ty))
+            }
+            Export::LiftedFunction { ty: idx, .. } => {
+                Self::ComponentFunc(ComponentFunc::from(*idx, ty))
+            }
+            Export::ModuleStatic { ty: idx, .. } | Export::ModuleImport { ty: idx, .. } => {
+                Self::Module(Module::from(*idx, ty))
+            }
+            Export::Type(idx) => Self::from(engine, idx, ty),
         }
     }
 }

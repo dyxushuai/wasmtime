@@ -85,6 +85,9 @@ audit-as-crates-io = true
 [policy.cranelift-serde]
 audit-as-crates-io = true
 
+[policy.cranelift-srcgen]
+audit-as-crates-io = true
+
 [policy.isle-fuzz]
 criteria = []
 
@@ -94,37 +97,22 @@ audit-as-crates-io = true
 [policy.pulley-interpreter-fuzz]
 criteria = []
 
+[policy.pulley-macros]
+audit-as-crates-io = true
+
 [policy.wasi-common]
 audit-as-crates-io = true
 
 [policy.wasmtime]
 audit-as-crates-io = true
 
-[policy.wasmtime-asm-macros]
-audit-as-crates-io = true
-
 [policy.wasmtime-c-api-impl]
 audit-as-crates-io = false
-
-[policy.wasmtime-c-api-macros]
-audit-as-crates-io = false
-
-[policy.wasmtime-cache]
-audit-as-crates-io = true
 
 [policy.wasmtime-cli]
 audit-as-crates-io = true
 
 [policy.wasmtime-cli-flags]
-audit-as-crates-io = true
-
-[policy.wasmtime-component-macro]
-audit-as-crates-io = true
-
-[policy.wasmtime-component-util]
-audit-as-crates-io = true
-
-[policy.wasmtime-cranelift]
 audit-as-crates-io = true
 
 [policy.wasmtime-environ]
@@ -133,32 +121,11 @@ audit-as-crates-io = true
 [policy.wasmtime-environ-fuzz]
 criteria = []
 
-[policy.wasmtime-explorer]
-audit-as-crates-io = true
-
-[policy.wasmtime-fiber]
-audit-as-crates-io = true
-
 [policy.wasmtime-fuzz]
 criteria = []
 
 [policy.wasmtime-fuzzing]
 criteria = []
-
-[policy.wasmtime-jit-debug]
-audit-as-crates-io = true
-
-[policy.wasmtime-jit-icache-coherence]
-audit-as-crates-io = true
-
-[policy.wasmtime-math]
-audit-as-crates-io = true
-
-[policy.wasmtime-slab]
-audit-as-crates-io = true
-
-[policy.wasmtime-versioned-export-macros]
-audit-as-crates-io = false
 
 [policy.wasmtime-wasi]
 audit-as-crates-io = true
@@ -181,16 +148,10 @@ audit-as-crates-io = true
 [policy.wasmtime-wasi-threads]
 audit-as-crates-io = true
 
+[policy.wasmtime-wasi-tls]
+audit-as-crates-io = true
+
 [policy.wasmtime-wast]
-audit-as-crates-io = true
-
-[policy.wasmtime-winch]
-audit-as-crates-io = true
-
-[policy.wasmtime-wit-bindgen]
-audit-as-crates-io = true
-
-[policy.wasmtime-wmemcheck]
 audit-as-crates-io = true
 
 [policy.wiggle]
@@ -310,10 +271,6 @@ criteria = "safe-to-deploy"
 version = "0.2.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.gimli]]
-version = "0.26.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.h2]]
 version = "0.4.4"
 criteria = "safe-to-deploy"
@@ -393,7 +350,7 @@ version = "0.2.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.mio]]
-version = "0.8.11"
+version = "1.0.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.ndarray]]
@@ -420,6 +377,14 @@ criteria = "safe-to-deploy"
 version = "1.12.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.openssl]]
+version = "0.10.73"
+criteria = "safe-to-deploy"
+
+[[exemptions.openssl-sys]]
+version = "0.9.109"
+criteria = "safe-to-deploy"
+
 [[exemptions.openvino-finder]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
@@ -438,10 +403,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.ppv-lite86]]
 version = "0.2.16"
-criteria = "safe-to-deploy"
-
-[[exemptions.pretty_env_logger]]
-version = "0.4.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.proptest]]
@@ -485,7 +446,7 @@ version = "2.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ring]]
-version = "0.17.3"
+version = "0.17.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls]]
@@ -504,8 +465,16 @@ criteria = "safe-to-deploy"
 version = "0.3.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.shellexpand]]
-version = "2.1.0"
+[[exemptions.schannel]]
+version = "0.1.27"
+criteria = "safe-to-deploy"
+
+[[exemptions.security-framework]]
+version = "2.11.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.security-framework-sys]]
+version = "2.14.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.shuffling-allocator]]
@@ -522,10 +491,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.souper-ir]]
 version = "2.1.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.spin]]
-version = "0.9.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.stable_deref_trait]]
@@ -549,12 +514,12 @@ version = "0.3.36"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
-version = "1.30.0"
+version = "1.44.2"
 criteria = "safe-to-deploy"
 notes = "we are exempting tokio, hyper, and their tightly coupled dependencies by the same authors, expecting that the authors at aws will publish attestions we can import at some point soon"
 
 [[exemptions.tokio-macros]]
-version = "1.7.0"
+version = "2.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-rustls]]

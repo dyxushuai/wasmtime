@@ -63,14 +63,14 @@
 
 use crate::{
     cursor::{Cursor, FuncCursor},
-    dominator_tree::DominatorTree,
+    dominator_tree::DominatorTreePreorder,
     inst_predicates::{
         has_memory_fence_semantics, inst_addr_offset_type, inst_store_data, visit_block_succs,
     },
-    ir::{immediates::Offset32, AliasRegion, Block, Function, Inst, Opcode, Type, Value},
+    ir::{AliasRegion, Block, Function, Inst, Opcode, Type, Value, immediates::Offset32},
     trace,
 };
-use cranelift_entity::{packed_option::PackedOption, EntityRef};
+use cranelift_entity::{EntityRef, packed_option::PackedOption};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// For a given program point, the vector of last-store instruction
@@ -176,7 +176,7 @@ struct MemoryLoc {
 /// An alias-analysis pass.
 pub struct AliasAnalysis<'a> {
     /// The domtree for the function.
-    domtree: &'a DominatorTree,
+    domtree: &'a DominatorTreePreorder,
 
     /// Input state to a basic block.
     block_input: FxHashMap<Block, LastStores>,
@@ -191,7 +191,7 @@ pub struct AliasAnalysis<'a> {
 
 impl<'a> AliasAnalysis<'a> {
     /// Perform an alias analysis pass.
-    pub fn new(func: &Function, domtree: &'a DominatorTree) -> AliasAnalysis<'a> {
+    pub fn new(func: &Function, domtree: &'a DominatorTreePreorder) -> AliasAnalysis<'a> {
         trace!("alias analysis: input is:\n{:?}", func);
         let mut analysis = AliasAnalysis {
             domtree,
@@ -229,7 +229,7 @@ impl<'a> AliasAnalysis<'a> {
             }
 
             visit_block_succs(func, block, |_inst, succ, _from_table| {
-                let succ_first_inst = func.layout.block_insts(succ).into_iter().next().unwrap();
+                let succ_first_inst = func.layout.block_insts(succ).next().unwrap();
                 let updated = match self.block_input.get_mut(&succ) {
                     Some(succ_state) => {
                         let old = *succ_state;
@@ -333,7 +333,7 @@ impl<'a> AliasAnalysis<'a> {
                             value.index(),
                             def_inst.index()
                         );
-                        if self.domtree.dominates(def_inst, inst, &func.layout) {
+                        if self.domtree.dominates_inst(def_inst, inst, &func.layout) {
                             trace!(
                                 " -> dominates; value equiv from v{} to v{} inserted",
                                 load_result.index(),

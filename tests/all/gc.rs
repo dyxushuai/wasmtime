@@ -1,6 +1,6 @@
 use super::ref_types_module;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use wasmtime::*;
 
 struct SetFlagOnDrop(Arc<AtomicBool>);
@@ -107,8 +107,6 @@ fn wasm_dropping_refs() -> Result<()> {
 
     let num_refs_dropped = Arc::new(AtomicUsize::new(0));
 
-    // NB: 4096 is greater than the initial `VMExternRefActivationsTable`
-    // capacity, so this will trigger at least one GC.
     for _ in 0..4096 {
         let mut scope = RootScope::new(&mut store);
         let r = ExternRef::new(&mut scope, CountDrops(num_refs_dropped.clone()))?;
@@ -116,9 +114,7 @@ fn wasm_dropping_refs() -> Result<()> {
         drop_ref.call(&mut scope, &args, &mut [])?;
     }
 
-    assert!(num_refs_dropped.load(SeqCst) > 0);
-
-    // And after doing a final GC, all the refs should have been dropped.
+    // After doing a GC, all the refs should have been dropped.
     store.gc(None);
     assert_eq!(num_refs_dropped.load(SeqCst), 4096);
 
@@ -1312,5 +1308,89 @@ fn gc_heap_oom() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn issue_10772() -> Result<()> {
+    let mut store = crate::gc_store()?;
+    let engine = store.engine().clone();
+
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (type $empty (struct))
+                (type $tuple-concrete (struct (field (ref $empty))))
+                (type $tuple-abstract (struct (field (ref struct))))
+                (func (export "abstract") (param $t (ref $tuple-abstract))
+                    (drop (ref.cast (ref $tuple-concrete) (local.get $t)))
+                )
+            )
+        "#,
+    )?;
+
+    let linker = Linker::new(&engine);
+
+    let instance = linker.instantiate(&mut store, &module)?;
+    let abstract_ = instance.get_func(&mut store, "abstract").unwrap();
+    let empty_pre = StructRefPre::new(&mut store, StructType::new(&engine, [])?);
+    let empty_struct = StructRef::new(&mut store, &empty_pre, &[])?;
+    let tuple_pre = StructRefPre::new(
+        &mut store,
+        StructType::new(
+            &engine,
+            [FieldType::new(
+                Mutability::Const,
+                StorageType::ValType(ValType::Ref(RefType::new(false, HeapType::Struct))),
+            )],
+        )?,
+    );
+    let tuple_struct = StructRef::new(&mut store, &tuple_pre, &[empty_struct.into()])?;
+    let tuple_any = Val::from(tuple_struct);
+
+    match abstract_.call(store, &[tuple_any], &mut []) {
+        Ok(()) => panic!("should have trapped on cast failure"),
+        Err(e) => {
+            let trap = e.downcast::<Trap>().expect("should fail with a trap");
+            assert_eq!(trap, Trap::CastFailure);
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn drc_gc_inbetween_host_calls() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    config.collector(Collector::DeferredReferenceCounting);
+
+    let engine = Engine::new(&config)?;
+
+    let mut store = Store::new(&engine, ());
+    let func = Func::wrap(&mut store, |_: Option<Rooted<ExternRef>>| {});
+
+    let mut invoke_func = || {
+        let inner_dropped = Arc::new(AtomicBool::new(false));
+        {
+            let mut scope = RootScope::new(&mut store);
+            let r = ExternRef::new(&mut scope, SetFlagOnDrop(inner_dropped.clone()))?;
+            func.call(&mut scope, &[r.into()], &mut [])?;
+        }
+
+        assert!(!inner_dropped.load(SeqCst));
+        store.gc(None);
+        assert!(inner_dropped.load(SeqCst));
+        anyhow::Ok(())
+    };
+
+    invoke_func()?;
+    invoke_func()?;
+
     Ok(())
 }

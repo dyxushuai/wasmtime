@@ -1,3 +1,5 @@
+#[cfg(feature = "component-model-async")]
+use crate::component::concurrent::Accessor;
 use crate::component::func::HostFunc;
 use crate::component::instance::RuntimeImport;
 use crate::component::matching::{InstanceType, TypeChecker};
@@ -12,8 +14,8 @@ use alloc::sync::Arc;
 use core::marker;
 #[cfg(feature = "async")]
 use core::{future::Future, pin::Pin};
-use wasmtime_environ::component::{NameMap, NameMapIntern};
 use wasmtime_environ::PrimaryMap;
+use wasmtime_environ::component::{NameMap, NameMapIntern};
 
 /// A type used to instantiate [`Component`]s.
 ///
@@ -56,7 +58,7 @@ use wasmtime_environ::PrimaryMap;
 /// for guests to upgrade WASI. So long as the actual "meat" of the
 /// functionality is defined then it should align correctly and components can
 /// be instantiated.
-pub struct Linker<T> {
+pub struct Linker<T: 'static> {
     engine: Engine,
     strings: Strings,
     map: NameMap<usize, Definition>,
@@ -65,7 +67,7 @@ pub struct Linker<T> {
     _marker: marker::PhantomData<fn() -> T>,
 }
 
-impl<T> Clone for Linker<T> {
+impl<T: 'static> Clone for Linker<T> {
     fn clone(&self) -> Linker<T> {
         Linker {
             engine: self.engine.clone(),
@@ -89,7 +91,7 @@ pub struct Strings {
 /// Instances do not need to be actual [`Instance`]s and instead are defined by
 /// a "bag of named items", so each [`LinkerInstance`] can further define items
 /// internally.
-pub struct LinkerInstance<'a, T> {
+pub struct LinkerInstance<'a, T: 'static> {
     engine: &'a Engine,
     path: &'a mut Vec<usize>,
     path_len: usize,
@@ -107,7 +109,7 @@ pub(crate) enum Definition {
     Resource(ResourceType, Arc<crate::func::HostFunc>),
 }
 
-impl<T> Linker<T> {
+impl<T: 'static> Linker<T> {
     /// Creates a new linker for the [`Engine`] specified with no items defined
     /// within it.
     pub fn new(engine: &Engine) -> Linker<T> {
@@ -210,7 +212,12 @@ impl<T> Linker<T> {
     /// `component` imports or if a name defined doesn't match the type of the
     /// item imported by the `component` provided.
     pub fn instantiate_pre(&self, component: &Component) -> Result<InstancePre<T>> {
-        self.typecheck(&component)?;
+        let cx = self.typecheck(&component)?;
+
+        // A successful typecheck resolves all of the imported resources used by
+        // this InstancePre. We keep a clone of this table in the InstancePre
+        // so that we can construct an InstanceType for typechecking.
+        let imported_resources = cx.imported_resources.clone();
 
         // Now that all imports are known to be defined and satisfied by this
         // linker a list of "flat" import items (aka no instances) is created
@@ -247,7 +254,9 @@ impl<T> Linker<T> {
             let i = imports.push(import);
             assert_eq!(i, idx);
         }
-        Ok(unsafe { InstancePre::new_unchecked(component.clone(), imports) })
+        Ok(unsafe {
+            InstancePre::new_unchecked(component.clone(), Arc::new(imports), imported_resources)
+        })
     }
 
     /// Instantiates the [`Component`] provided into the `store` specified.
@@ -370,7 +379,7 @@ impl<T> Linker<T> {
     }
 }
 
-impl<T> LinkerInstance<'_, T> {
+impl<T: 'static> LinkerInstance<'_, T> {
     fn as_mut(&mut self) -> LinkerInstance<'_, T> {
         LinkerInstance {
             engine: self.engine,
@@ -383,7 +392,7 @@ impl<T> LinkerInstance<'_, T> {
         }
     }
 
-    /// Defines a new host-provided function into this [`Linker`].
+    /// Defines a new host-provided function into this [`LinkerInstance`].
     ///
     /// This method is used to give host functions to wasm components. The
     /// `func` provided will be callable from linked components with the type
@@ -399,6 +408,19 @@ impl<T> LinkerInstance<'_, T> {
     /// type parameter from [`Store<T>`](crate::Store) which is accessible
     /// through the leading [`StoreContextMut<'_, T>`](crate::StoreContextMut)
     /// argument which can be provided to the `func` given here.
+    ///
+    /// # Blocking / Async Behavior
+    ///
+    /// The host function `func` provided here is a blocking function from the
+    /// perspective of WebAssembly, regardless of how [`Config::async_support`]
+    /// is defined. This function can be used both with sync and async stores
+    /// and will always define a blocking function.
+    ///
+    /// To define a function which is async on the host, but blocking to the
+    /// guest, see the [`func_wrap_async`] method.
+    ///
+    /// [`Config::async_support`]: crate::Config::async_support
+    /// [`func_wrap_async`]: LinkerInstance::func_wrap_async
     //
     // TODO: needs more words and examples
     pub fn func_wrap<F, Params, Return>(&mut self, name: &str, func: F) -> Result<()>
@@ -411,17 +433,48 @@ impl<T> LinkerInstance<'_, T> {
         Ok(())
     }
 
-    /// Defines a new host-provided async function into this [`Linker`].
+    /// Defines a new host-provided async function into this [`LinkerInstance`].
     ///
-    /// This is exactly like [`Self::func_wrap`] except it takes an async
-    /// host function.
+    /// This function is similar to [`Self::func_wrap`] except it takes an async
+    /// host function instead of a blocking host function. The `F` function here
+    /// is intended to be:
+    ///
+    /// ```ignore
+    /// F: AsyncFn(StoreContextMut<'_, T>, Params) -> Result<Return>
+    /// ```
+    ///
+    /// however the returned future must be `Send` which is not possible to
+    /// bound at this time. This will be switched to an async closure once Rust
+    /// supports it.
+    ///
+    /// # Blocking / Async Behavior
+    ///
+    /// This function can only be called when [`Config::async_support`] is
+    /// enabled. The function defined which WebAssembly calls will still appear
+    /// as blocking from the perspective of WebAssembly itself. The host,
+    /// however, can perform asynchronous operations without blocking the thread
+    /// performing a call.
+    ///
+    /// When [`Config::async_support`] is enabled then all WebAssembly is
+    /// invoked on a separate stack within a Wasmtime-managed fiber. This means
+    /// that if the future returned by `F` is not immediately ready then the
+    /// fiber will be suspended to block WebAssembly but not the host. When the
+    /// future becomes ready again the fiber will be resumed to continue
+    /// execution within WebAssembly.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if [`Config::async_support`] is set to `false`.
+    ///
+    /// [`Config::async_support`]: crate::Config::async_support
+    /// [`func_wrap_async`]: LinkerInstance::func_wrap_async
     #[cfg(feature = "async")]
     pub fn func_wrap_async<Params, Return, F>(&mut self, name: &str, f: F) -> Result<()>
     where
-        F: for<'a> Fn(
-                StoreContextMut<'a, T>,
+        F: Fn(
+                StoreContextMut<'_, T>,
                 Params,
-            ) -> Box<dyn Future<Output = Result<Return>> + Send + 'a>
+            ) -> Box<dyn Future<Output = Result<Return>> + Send + '_>
             + Send
             + Sync
             + 'static,
@@ -432,47 +485,85 @@ impl<T> LinkerInstance<'_, T> {
             self.engine.config().async_support,
             "cannot use `func_wrap_async` without enabling async support in the config"
         );
-        let ff = move |mut store: StoreContextMut<'_, T>, params: Params| -> Result<Return> {
-            let async_cx = store.as_context_mut().0.async_cx().expect("async cx");
-            let future = f(store.as_context_mut(), params);
-            unsafe { async_cx.block_on(Pin::from(future)) }?
+        let ff = move |store: StoreContextMut<'_, T>, params: Params| -> Result<Return> {
+            store.block_on(|store| f(store, params).into())?
         };
         self.func_wrap(name, ff)
     }
 
     /// Defines a new host-provided async function into this [`LinkerInstance`].
     ///
-    /// This allows the caller to register host functions with the
-    /// LinkerInstance such that multiple calls to such functions can run
-    /// concurrently. This isn't possible with the existing func_wrap_async
-    /// method because it takes a function which returns a future that owns a
-    /// unique reference to the Store, meaning the Store can't be used for
-    /// anything else until the future resolves.
+    /// This function defines a host function available to call from
+    /// WebAssembly. WebAssembly may additionally make multiple invocations of
+    /// this function concurrently all at the same time. This function requires
+    /// the [`Config::wasm_component_model_async`] feature to be enabled.
     ///
-    /// Ideally, we'd have a way to thread a `StoreContextMut<T>` through an
-    /// arbitrary `Future` such that it has access to the `Store` only while
-    /// being polled (i.e. between, but not across, await points). However,
-    /// there's currently no way to express that in async Rust, so we make do
-    /// with a more awkward scheme: each function registered using
-    /// `func_wrap_concurrent` gets access to the `Store` twice: once before
-    /// doing any concurrent operations (i.e. before awaiting) and once
-    /// afterward. This allows multiple calls to proceed concurrently without
-    /// any one of them monopolizing the store.
+    /// The function `f` provided will be invoked when called by WebAssembly.
+    /// WebAssembly components may then call `f` multiple times while previous
+    /// invocations of `f` are already running. Additionally while `f` is
+    /// running other host functions may be invoked.
+    ///
+    /// The `F` function here is intended to be:
+    ///
+    /// ```ignore
+    /// F: AsyncFn(&mut Accessor<T>, Params) -> Result<Return>
+    /// ```
+    ///
+    /// however the returned future must be `Send` which is not possible to
+    /// bound at this time. This will be switched to an async closure once Rust
+    /// supports it.
+    ///
+    /// The closure `f` is provided an [`Accessor`] which can be used to acquire
+    /// temporary, blocking, access to a [`StoreContextMut`] (through
+    /// [`Access`]). This models how a store is not available to `f` across
+    /// `await` points but it is temporarily available while actively being
+    /// polled.
+    ///
+    /// # Blocking / Async Behavior
+    ///
+    /// This function can only be called when [`Config::async_support`] is
+    /// enabled. Unlike [`Self::func_wrap`] and [`Self::func_wrap_async`] this
+    /// function is asynchronous even from the perspective of guest WebAssembly.
+    /// This means that if `f` is not immediately resolved then the call from
+    /// WebAssembly will still return immediately (assuming it was lowered with
+    /// `async`). The closure `f` should not block the current thread and should
+    /// only perform blocking via `async` meaning that `f` won't block either
+    /// WebAssembly nor the host.
+    ///
+    /// Note that WebAssembly components can lower host functions both with and
+    /// without `async`. That means that even if a host function is defined in
+    /// the "concurrent" mode here a guest may still lower it synchronously. In
+    /// this situation Wasmtime will manage blocking the guest while the closure
+    /// `f` provided here completes. If a guest lowers this function with
+    /// `async`, though, then no blocking will happen.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if [`Config::async_support`] is set to `false`.
+    ///
+    /// [`Config::async_support`]: crate::Config::async_support
+    /// [`Config::wasm_component_model_async`]: crate::Config::wasm_component_model_async
+    /// [`func_wrap_async`]: LinkerInstance::func_wrap_async
     #[cfg(feature = "component-model-async")]
-    pub fn func_wrap_concurrent<Params, Return, F, N, FN>(&mut self, name: &str, f: F) -> Result<()>
+    pub fn func_wrap_concurrent<Params, Return, F>(&mut self, name: &str, f: F) -> Result<()>
     where
-        N: FnOnce(StoreContextMut<T>) -> Result<Return> + Send + Sync + 'static,
-        FN: Future<Output = N> + Send + Sync + 'static,
-        F: Fn(StoreContextMut<T>, Params) -> FN + Send + Sync + 'static,
+        T: 'static,
+        F: Fn(
+                &mut Accessor<T>,
+                Params,
+            ) -> Pin<Box<dyn Future<Output = Result<Return>> + Send + '_>>
+            + Send
+            + Sync
+            + 'static,
         Params: ComponentNamedList + Lift + 'static,
-        Return: ComponentNamedList + Lower + Send + Sync + 'static,
+        Return: ComponentNamedList + Lower + 'static,
     {
         assert!(
             self.engine.config().async_support,
             "cannot use `func_wrap_concurrent` without enabling async support in the config"
         );
-        _ = (name, f);
-        todo!()
+        self.insert(name, Definition::Func(HostFunc::from_concurrent(f)))?;
+        Ok(())
     }
 
     /// Define a new host-provided function using dynamically typed values.
@@ -585,8 +676,10 @@ impl<T> LinkerInstance<'_, T> {
 
     /// Define a new host-provided async function using dynamic types.
     ///
-    /// This is exactly like [`Self::func_new`] except it takes an async
-    /// host function.
+    /// As [`Self::func_wrap_async`] is a dual of [`Self::func_wrap`], this
+    /// function is the dual of [`Self::func_new`].
+    ///
+    /// For documentation on blocking behavior see [`Self::func_wrap_async`].
     #[cfg(feature = "async")]
     pub fn func_new_async<F>(&mut self, name: &str, f: F) -> Result<()>
     where
@@ -603,12 +696,38 @@ impl<T> LinkerInstance<'_, T> {
             self.engine.config().async_support,
             "cannot use `func_new_async` without enabling async support in the config"
         );
-        let ff = move |mut store: StoreContextMut<'_, T>, params: &[Val], results: &mut [Val]| {
-            let async_cx = store.as_context_mut().0.async_cx().expect("async cx");
-            let future = f(store.as_context_mut(), params, results);
-            unsafe { async_cx.block_on(Pin::from(future)) }?
+        let ff = move |store: StoreContextMut<'_, T>, params: &[Val], results: &mut [Val]| {
+            store.with_blocking(|store, cx| cx.block_on(Pin::from(f(store, params, results)))?)
         };
-        self.func_new(name, ff)
+        return self.func_new(name, ff);
+    }
+
+    /// Define a new host-provided async function using dynamic types.
+    ///
+    /// As [`Self::func_wrap_concurrent`] is a dual of [`Self::func_wrap`], this
+    /// function is the dual of [`Self::func_new`].
+    ///
+    /// For documentation on async/blocking behavior see
+    /// [`Self::func_wrap_concurrent`].
+    #[cfg(feature = "component-model-async")]
+    pub fn func_new_concurrent<F>(&mut self, name: &str, f: F) -> Result<()>
+    where
+        T: 'static,
+        F: for<'a> Fn(
+                &'a mut Accessor<T>,
+                &'a [Val],
+                &'a mut [Val],
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        assert!(
+            self.engine.config().async_support,
+            "cannot use `func_wrap_concurrent` without enabling async support in the config"
+        );
+        self.insert(name, Definition::Func(HostFunc::new_dynamic_concurrent(f)))?;
+        Ok(())
     }
 
     /// Defines a [`Module`] within this instance.
@@ -661,10 +780,7 @@ impl<T> LinkerInstance<'_, T> {
     #[cfg(feature = "async")]
     pub fn resource_async<F>(&mut self, name: &str, ty: ResourceType, dtor: F) -> Result<()>
     where
-        F: for<'a> Fn(
-                StoreContextMut<'a, T>,
-                u32,
-            ) -> Box<dyn Future<Output = Result<()>> + Send + 'a>
+        F: Fn(StoreContextMut<'_, T>, u32) -> Box<dyn Future<Output = Result<()>> + Send + '_>
             + Send
             + Sync
             + 'static,
@@ -676,12 +792,8 @@ impl<T> LinkerInstance<'_, T> {
         let dtor = Arc::new(crate::func::HostFunc::wrap_inner(
             &self.engine,
             move |mut cx: crate::Caller<'_, T>, (param,): (u32,)| {
-                let async_cx = cx.as_context_mut().0.async_cx().expect("async cx");
-                let future = dtor(cx.as_context_mut(), param);
-                match unsafe { async_cx.block_on(Pin::from(future)) } {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(trap)) | Err(trap) => Err(trap),
-                }
+                cx.as_context_mut()
+                    .block_on(|store| dtor(store, param).into())?
             },
         ));
         self.insert(name, Definition::Resource(ty, dtor))?;

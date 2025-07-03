@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
-use test_programs_artifacts::{foreach_keyvalue, KEYVALUE_MAIN_COMPONENT};
+use anyhow::{Result, anyhow};
+use test_programs_artifacts::{KEYVALUE_MAIN_COMPONENT, foreach_keyvalue};
 use wasmtime::{
-    component::{Component, Linker, ResourceTable},
     Store,
+    component::{Component, Linker, ResourceTable},
 };
-use wasmtime_wasi::{bindings::Command, IoView, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView, bindings::Command};
 use wasmtime_wasi_keyvalue::{WasiKeyValue, WasiKeyValueCtx, WasiKeyValueCtxBuilder};
 
 struct Ctx {
@@ -32,7 +32,7 @@ async fn run_wasi(path: &str, ctx: Ctx) -> Result<()> {
     let component = Component::from_file(&engine, path)?;
 
     let mut linker = Linker::new(&engine);
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_keyvalue::add_to_linker(&mut linker, |h: &mut Ctx| {
         WasiKeyValue::new(&h.wasi_keyvalue_ctx, &mut h.table)
     })?;

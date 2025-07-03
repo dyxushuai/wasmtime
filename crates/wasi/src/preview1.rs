@@ -19,8 +19,8 @@
 //! support in this module is enough to run wasm modules but any customization
 //! beyond that [`WasiCtxBuilder`] already supports is not possible yet.
 //!
-//! [`WasiCtxBuilder`]: crate::WasiCtxBuilder
-//! [`build_p1`]: crate::WasiCtxBuilder::build_p1
+//! [`WasiCtxBuilder`]: crate::p2::WasiCtxBuilder
+//! [`build_p1`]: crate::p2::WasiCtxBuilder::build_p1
 //! [`Config::async_support`]: wasmtime::Config::async_support
 //!
 //! # Components vs Modules
@@ -36,7 +36,7 @@
 //! ```no_run
 //! use wasmtime::{Result, Engine, Linker, Module, Store};
 //! use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-//! use wasmtime_wasi::WasiCtxBuilder;
+//! use wasmtime_wasi::p2::WasiCtxBuilder;
 //!
 //! // An example of executing a WASIp1 "command"
 //! fn main() -> Result<()> {
@@ -63,7 +63,8 @@
 //! }
 //! ```
 
-use crate::bindings::{
+use crate::ResourceTable;
+use crate::p2::bindings::{
     cli::{
         stderr::Host as _, stdin::Host as _, stdout::Host as _, terminal_input, terminal_output,
         terminal_stderr::Host as _, terminal_stdin::Host as _, terminal_stdout::Host as _,
@@ -71,28 +72,28 @@ use crate::bindings::{
     clocks::{monotonic_clock, wall_clock},
     filesystem::{preopens::Host as _, types as filesystem},
 };
-use crate::{FsError, IsATTY, ResourceTable, WasiCtx, WasiImpl, WasiView};
-use anyhow::{bail, Context};
+use crate::p2::{FsError, IsATTY, WasiCtx, WasiImpl, WasiView};
+use anyhow::{Context, bail};
 use std::collections::{BTreeMap, HashSet};
 use std::mem::{self, size_of, size_of_val};
 use std::ops::{Deref, DerefMut};
 use std::slice;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use system_interface::fs::FileIoExt;
 use wasmtime::component::Resource;
 use wasmtime_wasi_io::{
+    IoImpl, IoView,
     bindings::wasi::io::streams,
     streams::{StreamError, StreamResult},
-    IoImpl, IoView,
 };
 use wiggle::tracing::instrument;
 use wiggle::{GuestError, GuestMemory, GuestPtr, GuestType};
 
 // Bring all WASI traits in scope that this implementation builds on.
-use crate::bindings::cli::environment::Host as _;
-use crate::bindings::filesystem::types::HostDescriptor as _;
-use crate::bindings::random::random::Host as _;
+use crate::p2::bindings::cli::environment::Host as _;
+use crate::p2::bindings::filesystem::types::HostDescriptor as _;
+use crate::p2::bindings::random::random::Host as _;
 use wasmtime_wasi_io::bindings::wasi::io::poll::Host as _;
 
 /// Structure containing state for WASIp1.
@@ -105,15 +106,15 @@ use wasmtime_wasi_io::bindings::wasi::io::poll::Host as _;
 /// Instances of [`WasiP1Ctx`] are typically stored within the `T` of
 /// [`Store<T>`](wasmtime::Store).
 ///
-/// [`WasiCtxBuilder::build_p1`]: crate::WasiCtxBuilder::build_p1
-/// [`WasiCtxBuilder`]: crate::WasiCtxBuilder
+/// [`WasiCtxBuilder::build_p1`]: crate::p2::WasiCtxBuilder::build_p1
+/// [`WasiCtxBuilder`]: crate::p2::WasiCtxBuilder
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use wasmtime::{Result, Linker};
 /// use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-/// use wasmtime_wasi::WasiCtxBuilder;
+/// use wasmtime_wasi::p2::WasiCtxBuilder;
 ///
 /// struct MyState {
 ///     // ... custom state as necessary ...
@@ -175,7 +176,7 @@ impl WasiView for WasiP1Ctx {
 
 #[derive(Debug)]
 struct File {
-    /// The handle to the preview2 descriptor of type [`crate::filesystem::Descriptor::File`].
+    /// The handle to the preview2 descriptor of type [`crate::p2::filesystem::Descriptor::File`].
     fd: Resource<filesystem::Descriptor>,
 
     /// The current-position pointer.
@@ -266,14 +267,14 @@ enum Descriptor {
         stream: Resource<streams::OutputStream>,
         isatty: IsATTY,
     },
-    /// A fd of type [`crate::filesystem::Descriptor::Dir`]
+    /// A fd of type [`crate::p2::filesystem::Descriptor::Dir`]
     Directory {
         fd: Resource<filesystem::Descriptor>,
         /// The path this directory was preopened as.
         /// `None` means this directory was opened using `open-at`.
         preopen_path: Option<String>,
     },
-    /// A fd of type [`crate::filesystem::Descriptor::File`]
+    /// A fd of type [`crate::p2::filesystem::Descriptor::File`]
     File(File),
 }
 
@@ -532,8 +533,7 @@ impl WasiP1Ctx {
             descriptors
         } else {
             Descriptors::new(self.as_wasi_impl())?
-        }
-        .into();
+        };
         Ok(Transaction {
             view: self,
             descriptors,
@@ -550,7 +550,7 @@ impl WasiP1Ctx {
 
     /// Lazily initializes [`WasiPreview1Adapter`] returned by [`WasiPreview1View::adapter_mut`]
     /// and returns [`filesystem::Descriptor`] corresponding to `fd`
-    /// if it describes a [`Descriptor::File`] of [`crate::filesystem::File`] type
+    /// if it describes a [`Descriptor::File`] of [`crate::p2::filesystem::File`] type
     fn get_file_fd(
         &mut self,
         fd: types::Fd,
@@ -563,7 +563,7 @@ impl WasiP1Ctx {
     /// Lazily initializes [`WasiPreview1Adapter`] returned by [`WasiPreview1View::adapter_mut`]
     /// and returns [`filesystem::Descriptor`] corresponding to `fd`
     /// if it describes a [`Descriptor::File`] or [`Descriptor::PreopenDirectory`]
-    /// of [`crate::filesystem::Dir`] type
+    /// of [`crate::p2::filesystem::Dir`] type
     fn get_dir_fd(
         &mut self,
         fd: types::Fd,
@@ -677,7 +677,7 @@ enum FdWrite {
 /// This method will add WASIp1 functions to `linker`. Access to [`WasiP1Ctx`]
 /// is provided with `f` by projecting from the store-local state of `T` to
 /// [`WasiP1Ctx`]. The closure `f` is invoked every time a WASIp1 function is
-/// called to get access to [`WASIp1`] from `T`. The returned [`WasiP1Ctx`] is
+/// called to get access to [`WasiP1Ctx`] from `T`. The returned [`WasiP1Ctx`] is
 /// used to implement I/O and controls what each function will return.
 ///
 /// It's recommended that [`WasiP1Ctx`] is stored as a field in `T` or that `T =
@@ -738,7 +738,7 @@ enum FdWrite {
 ///     Ok(())
 /// }
 /// ```
-pub fn add_to_linker_async<T: Send>(
+pub fn add_to_linker_async<T: Send + 'static>(
     linker: &mut wasmtime::Linker<T>,
     f: impl Fn(&mut T) -> &mut WasiP1Ctx + Copy + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
@@ -751,7 +751,7 @@ pub fn add_to_linker_async<T: Send>(
 /// This method will add WASIp1 functions to `linker`. Access to [`WasiP1Ctx`]
 /// is provided with `f` by projecting from the store-local state of `T` to
 /// [`WasiP1Ctx`]. The closure `f` is invoked every time a WASIp1 function is
-/// called to get access to [`WASIp1`] from `T`. The returned [`WasiP1Ctx`] is
+/// called to get access to [`WasiP1Ctx`] from `T`. The returned [`WasiP1Ctx`] is
 /// used to implement I/O and controls what each function will return.
 ///
 /// It's recommended that [`WasiP1Ctx`] is stored as a field in `T` or that `T =
@@ -812,11 +812,11 @@ pub fn add_to_linker_async<T: Send>(
 ///     Ok(())
 /// }
 /// ```
-pub fn add_to_linker_sync<T: Send>(
+pub fn add_to_linker_sync<T: Send + 'static>(
     linker: &mut wasmtime::Linker<T>,
     f: impl Fn(&mut T) -> &mut WasiP1Ctx + Copy + Send + Sync + 'static,
 ) -> anyhow::Result<()> {
-    crate::preview1::sync::add_wasi_snapshot_preview1_to_linker(linker, f)
+    sync::add_wasi_snapshot_preview1_to_linker(linker, f)
 }
 
 // Generate the wasi_snapshot_preview1::WasiSnapshotPreview1 trait,
@@ -824,7 +824,7 @@ pub fn add_to_linker_sync<T: Send>(
 // None of the generated modules, traits, or types should be used externally
 // to this module.
 wiggle::from_witx!({
-    witx: ["$CARGO_MANIFEST_DIR/witx/preview1/wasi_snapshot_preview1.witx"],
+    witx: ["witx/preview1/wasi_snapshot_preview1.witx"],
     async: {
         wasi_snapshot_preview1::{
             fd_advise, fd_close, fd_datasync, fd_fdstat_get, fd_filestat_get, fd_filestat_set_size,
@@ -842,7 +842,7 @@ pub(crate) mod sync {
     use std::future::Future;
 
     wiggle::wasmtime_integration!({
-        witx: ["$CARGO_MANIFEST_DIR/witx/preview1/wasi_snapshot_preview1.witx"],
+        witx: ["witx/preview1/wasi_snapshot_preview1.witx"],
         target: super,
         block_on[in_tokio]: {
             wasi_snapshot_preview1::{
@@ -1261,7 +1261,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                     .map_err(types::Error::trap)?
             }
             types::Clockid::ProcessCputimeId | types::Clockid::ThreadCputimeId => {
-                return Err(types::Errno::Badf.into())
+                return Err(types::Errno::Badf.into());
             }
         };
         Ok(res)
@@ -1283,7 +1283,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 .context("failed to call `monotonic_clock::now`")
                 .map_err(types::Error::trap)?,
             types::Clockid::ProcessCputimeId | types::Clockid::ThreadCputimeId => {
-                return Err(types::Errno::Badf.into())
+                return Err(types::Errno::Badf.into());
             }
         };
         Ok(now)
@@ -2157,11 +2157,11 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             .await?;
         let mut t = self.transact()?;
         let desc = match t.view.table().get(&fd)? {
-            crate::filesystem::Descriptor::Dir(_) => Descriptor::Directory {
+            crate::p2::filesystem::Descriptor::Dir(_) => Descriptor::Directory {
                 fd,
                 preopen_path: None,
             },
-            crate::filesystem::Descriptor::File(_) => Descriptor::File(File {
+            crate::p2::filesystem::Descriptor::File(_) => Descriptor::File(File {
                 fd,
                 position: Default::default(),
                 append: fdflags.contains(types::Fdflags::APPEND),
@@ -2570,7 +2570,6 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         Ok(())
     }
 
-    #[allow(unused_variables)]
     #[instrument(skip(self, _memory))]
     fn sock_accept(
         &mut self,
@@ -2583,7 +2582,6 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         Err(types::Errno::Notsock.into())
     }
 
-    #[allow(unused_variables)]
     #[instrument(skip(self, _memory))]
     fn sock_recv(
         &mut self,
@@ -2597,7 +2595,6 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         Err(types::Errno::Notsock.into())
     }
 
-    #[allow(unused_variables)]
     #[instrument(skip(self, _memory))]
     fn sock_send(
         &mut self,
@@ -2611,7 +2608,6 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         Err(types::Errno::Notsock.into())
     }
 
-    #[allow(unused_variables)]
     #[instrument(skip(self, _memory))]
     fn sock_shutdown(
         &mut self,

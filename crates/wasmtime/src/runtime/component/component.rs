@@ -1,30 +1,26 @@
+use crate::component::InstanceExportLookup;
 use crate::component::matching::InstanceType;
 use crate::component::types;
-use crate::component::InstanceExportLookup;
 use crate::prelude::*;
-use crate::runtime::vm::component::ComponentRuntimeInfo;
 #[cfg(feature = "std")]
 use crate::runtime::vm::open_file_for_mmap;
-use crate::runtime::vm::{
-    CompiledModuleId, VMArrayCallFunction, VMFuncRef, VMFunctionBody, VMWasmCallFunction,
-};
+use crate::runtime::vm::{CompiledModuleId, VMArrayCallFunction, VMFuncRef, VMWasmCallFunction};
 use crate::{
-    code::CodeObject, code_memory::CodeMemory, type_registry::TypeCollection, Engine, Module,
-    ResourcesRequired,
+    Engine, Module, ResourcesRequired, code::CodeObject, code_memory::CodeMemory,
+    type_registry::TypeCollection,
 };
 use crate::{FuncType, ValType};
 use alloc::sync::Arc;
-use core::any::Any;
 use core::ops::Range;
 use core::ptr::NonNull;
 #[cfg(feature = "std")]
 use std::path::Path;
-use wasmtime_environ::component::{
-    AllCallFunc, CompiledComponentInfo, ComponentArtifacts, ComponentTypes, Export, ExportIndex,
-    GlobalInitializer, InstantiateModule, NameMapNoIntern, StaticModuleIndex, TrampolineIndex,
-    TypeComponentIndex, TypeDef, VMComponentOffsets,
-};
 use wasmtime_environ::TypeTrace;
+use wasmtime_environ::component::{
+    AllCallFunc, CanonicalOptions, CompiledComponentInfo, ComponentArtifacts, ComponentTypes,
+    CoreDef, Export, ExportIndex, GlobalInitializer, InstantiateModule, NameMapNoIntern,
+    StaticModuleIndex, TrampolineIndex, TypeComponentIndex, TypeFuncIndex, VMComponentOffsets,
+};
 use wasmtime_environ::{FunctionLoc, HostPtr, ObjectKind, PrimaryMap};
 
 /// A compiled WebAssembly Component.
@@ -93,7 +89,7 @@ struct ComponentInner {
     /// A cached handle to the `wasmtime::FuncType` for the canonical ABI's
     /// `realloc`, to avoid the need to look up types in the registry and take
     /// locks when calling `realloc` via `TypedFunc::call_raw`.
-    realloc_func_type: Arc<dyn Any + Send + Sync>,
+    realloc_func_type: Arc<FuncType>,
 }
 
 pub(crate) struct AllCallFuncPointers {
@@ -443,7 +439,7 @@ impl Component {
             engine,
             [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
             [ValType::I32],
-        )) as _;
+        ));
 
         Ok(Component {
             inner: Arc::new(ComponentInner {
@@ -477,7 +473,12 @@ impl Component {
 
     #[inline]
     pub(crate) fn types(&self) -> &Arc<ComponentTypes> {
-        self.inner.component_types()
+        match self.inner.code.types() {
+            crate::code::Types::Component(types) => types,
+            // The only creator of a `Component` is itself which uses the other
+            // variant, so this shouldn't be possible.
+            crate::code::Types::Module(_) => unreachable!(),
+        }
     }
 
     pub(crate) fn signatures(&self) -> &TypeCollection {
@@ -499,10 +500,10 @@ impl Component {
         }
     }
 
-    fn func(&self, loc: &FunctionLoc) -> NonNull<VMFunctionBody> {
+    fn func(&self, loc: &FunctionLoc) -> NonNull<u8> {
         let text = self.text();
         let trampoline = &text[loc.start as usize..][..loc.length as usize];
-        NonNull::new(trampoline.as_ptr() as *mut VMFunctionBody).unwrap()
+        NonNull::from(trampoline).cast()
     }
 
     pub(crate) fn code_object(&self) -> &Arc<CodeObject> {
@@ -519,10 +520,6 @@ impl Component {
     /// [`Module`]: crate::Module
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(self.code_object().code_memory().mmap().to_vec())
-    }
-
-    pub(crate) fn runtime_info(&self) -> Arc<dyn ComponentRuntimeInfo> {
-        self.inner.clone()
     }
 
     /// Creates a new `VMFuncRef` with all fields filled out for the destructor
@@ -674,6 +671,37 @@ impl Component {
     /// Looks up a specific export of this component by `name` optionally nested
     /// within the `instance` provided.
     ///
+    /// See related method [`Self::get_export`] for additional docs and
+    /// examples.
+    ///
+    /// This method is primarily used to acquire a [`ComponentExportIndex`]
+    /// which can be used with [`Instance`](crate::component::Instance) when
+    /// looking up exports. Export lookup with [`ComponentExportIndex`] can
+    /// skip string lookups at runtime and instead use a more efficient
+    /// index-based lookup.
+    ///
+    /// This method only returns the [`ComponentExportIndex`]. If you need the
+    /// corresponding [`types::ComponentItem`], use the related function
+    /// [`Self::get_export`].
+    ///
+    ///
+    /// [`Instance`](crate::component::Instance) has a corresponding method
+    /// [`Instance::get_export_index`](crate::component::Instance::get_export_index).
+    pub fn get_export_index(
+        &self,
+        instance: Option<&ComponentExportIndex>,
+        name: &str,
+    ) -> Option<ComponentExportIndex> {
+        let index = self.lookup_export_index(instance, name)?;
+        Some(ComponentExportIndex {
+            id: self.inner.id,
+            index,
+        })
+    }
+
+    /// Looks up a specific export of this component by `name` optionally nested
+    /// within the `instance` provided.
+    ///
     /// This method is primarily used to acquire a [`ComponentExportIndex`]
     /// which can be used with [`Instance`](crate::component::Instance) when
     /// looking up exports. Export lookup with [`ComponentExportIndex`] can
@@ -696,6 +724,14 @@ impl Component {
     /// implements the [`InstanceExportLookup`] trait which enables using it
     /// with [`Instance::get_func`](crate::component::Instance::get_func) for
     /// example.
+    ///
+    /// The returned [`types::ComponentItem`] is more expensive to calculate
+    /// than the [`ComponentExportIndex`]. If you only consume the
+    /// [`ComponentExportIndex`], use the related method
+    /// [`Self::get_export_index`] instead.
+    ///
+    /// [`Instance`](crate::component::Instance) has a corresponding method
+    /// [`Instance::get_export`](crate::component::Instance::get_export).
     ///
     /// # Examples
     ///
@@ -721,7 +757,7 @@ impl Component {
     /// )?;
     ///
     /// // Perform a lookup of the function "f" before instantiaton.
-    /// let (ty, export) = component.export_index(None, "f").unwrap();
+    /// let (ty, export) = component.get_export(None, "f").unwrap();
     /// assert!(matches!(ty, ComponentItem::ComponentFunc(_)));
     ///
     /// // After instantiation use `export` to lookup the function in question
@@ -733,23 +769,19 @@ impl Component {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn export_index(
+    pub fn get_export(
         &self,
         instance: Option<&ComponentExportIndex>,
         name: &str,
     ) -> Option<(types::ComponentItem, ComponentExportIndex)> {
         let info = self.env_component();
         let index = self.lookup_export_index(instance, name)?;
-        let ty = match info.export_items[index] {
-            Export::Instance { ty, .. } => TypeDef::ComponentInstance(ty),
-            Export::LiftedFunction { ty, .. } => TypeDef::ComponentFunc(ty),
-            Export::ModuleStatic { ty, .. } | Export::ModuleImport { ty, .. } => {
-                TypeDef::Module(ty)
-            }
-            Export::Type(ty) => ty,
-        };
         let item = self.with_uninstantiated_instance_type(|instance| {
-            types::ComponentItem::from(&self.inner.engine, &ty, instance)
+            types::ComponentItem::from_export(
+                &self.inner.engine,
+                &info.export_items[index],
+                instance,
+            )
         });
         Some((
             item,
@@ -789,11 +821,30 @@ impl Component {
     pub fn engine(&self) -> &Engine {
         &self.inner.engine
     }
+
+    pub(crate) fn realloc_func_ty(&self) -> &Arc<FuncType> {
+        &self.inner.realloc_func_type
+    }
+
+    /// Returns the `Export::LiftedFunction` metadata associated with `export`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `export` is out of bounds or if it isn't a `LiftedFunction`.
+    pub(crate) fn export_lifted_function(
+        &self,
+        export: ExportIndex,
+    ) -> (TypeFuncIndex, &CoreDef, &CanonicalOptions) {
+        match &self.env_component().export_items[export] {
+            Export::LiftedFunction { ty, func, options } => (*ty, func, options),
+            _ => unreachable!(),
+        }
+    }
 }
 
 /// A value which represents a known export of a component.
 ///
-/// This is the return value of [`Component::export_index`] and implements the
+/// This is the return value of [`Component::get_export`] and implements the
 /// [`InstanceExportLookup`] trait to work with lookups like
 /// [`Instance::get_func`](crate::component::Instance::get_func).
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
@@ -809,25 +860,6 @@ impl InstanceExportLookup for ComponentExportIndex {
         } else {
             None
         }
-    }
-}
-
-impl ComponentRuntimeInfo for ComponentInner {
-    fn component(&self) -> &wasmtime_environ::component::Component {
-        &self.info.component
-    }
-
-    fn component_types(&self) -> &Arc<ComponentTypes> {
-        match self.code.types() {
-            crate::code::Types::Component(types) => types,
-            // The only creator of a `Component` is itself which uses the other
-            // variant, so this shouldn't be possible.
-            crate::code::Types::Module(_) => unreachable!(),
-        }
-    }
-
-    fn realloc_func_type(&self) -> &Arc<dyn Any + Send + Sync> {
-        &self.realloc_func_type
     }
 }
 

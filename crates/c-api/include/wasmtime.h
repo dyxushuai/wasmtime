@@ -1,12 +1,16 @@
 /**
- * \mainpage Wasmtime C API
+ * \mainpage Wasmtime C/C++ API
  *
- * This documentation is an overview and API reference for the C API of
+ * This documentation is an overview and API reference for the C and C++ API of
  * Wasmtime. The C API is spread between three different header files:
  *
  * * \ref wasmtime.h
  * * \ref wasi.h
  * * \ref wasm.h
+ *
+ * The C++ API builds on the C API and thus is represented in just header files:
+ *
+ * * \ref wasmtime.hh
  *
  * The \ref wasmtime.h header file includes all the other header files and is
  * the main header file you'll likely be using. The \ref wasm.h header file
@@ -201,17 +205,19 @@
 #include <wasmtime/val.h>
 #include <wasmtime/async.h>
 #include <wasmtime/component.h>
+#include <wasmtime/wasip2.h>
+#include <wasmtime/wat.h>
 // IWYU pragma: end_exports
 // clang-format on
 
 /**
  * \brief Wasmtime version string.
  */
-#define WASMTIME_VERSION "33.0.0"
+#define WASMTIME_VERSION "35.0.0"
 /**
  * \brief Wasmtime major version number.
  */
-#define WASMTIME_VERSION_MAJOR 33
+#define WASMTIME_VERSION_MAJOR 35
 /**
  * \brief Wasmtime minor version number.
  */
@@ -220,35 +226,5 @@
  * \brief Wasmtime patch version number.
  */
 #define WASMTIME_VERSION_PATCH 0
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#ifdef WASMTIME_FEATURE_WAT
-
-/**
- * \brief Converts from the text format of WebAssembly to the binary format.
- *
- * \param wat this it the input pointer with the WebAssembly Text Format inside
- *        of it. This will be parsed and converted to the binary format.
- * \param wat_len this it the length of `wat`, in bytes.
- * \param ret if the conversion is successful, this byte vector is filled in
- *        with the WebAssembly binary format.
- *
- * \return a non-null error if parsing fails, or returns `NULL`. If parsing
- * fails then `ret` isn't touched.
- *
- * This function does not take ownership of `wat`, and the caller is expected to
- * deallocate the returned #wasmtime_error_t and #wasm_byte_vec_t.
- */
-WASM_API_EXTERN wasmtime_error_t *
-wasmtime_wat2wasm(const char *wat, size_t wat_len, wasm_byte_vec_t *ret);
-
-#endif
-
-#ifdef __cplusplus
-} // extern "C"
-#endif
 
 #endif // WASMTIME_API_H

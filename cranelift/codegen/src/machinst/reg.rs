@@ -205,7 +205,7 @@ impl<T> Writable<T> {
     /// the documentation for `Writable`, this is not hidden or
     /// disallowed from the outside; anyone can perform the "cast";
     /// but it is explicit so that we can audit the use sites.
-    pub fn from_reg(reg: T) -> Writable<T> {
+    pub const fn from_reg(reg: T) -> Writable<T> {
         Writable { reg }
     }
 
@@ -222,6 +222,21 @@ impl<T> Writable<T> {
     /// Map the underlying register to another value or type.
     pub fn map<U>(self, f: impl Fn(T) -> U) -> Writable<U> {
         Writable { reg: f(self.reg) }
+    }
+}
+
+// Proxy on assembler trait to the underlying register type.
+impl<R: cranelift_assembler_x64::AsReg> cranelift_assembler_x64::AsReg for Writable<R> {
+    fn enc(&self) -> u8 {
+        self.reg.enc()
+    }
+
+    fn to_string(&self, size: Option<cranelift_assembler_x64::gpr::Size>) -> String {
+        self.reg.to_string(size)
+    }
+
+    fn new(_: u8) -> Self {
+        panic!("disallow creation of new assembler registers")
     }
 }
 

@@ -4,15 +4,15 @@ use crate::variable::Variable;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug};
 use cranelift_codegen::cursor::{Cursor, CursorPosition, FuncCursor};
-use cranelift_codegen::entity::{EntityRef, EntitySet, SecondaryMap};
+use cranelift_codegen::entity::{EntityRef, EntitySet, PrimaryMap, SecondaryMap};
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    types, AbiParam, Block, DataFlowGraph, DynamicStackSlot, DynamicStackSlotData, ExtFuncData,
+    AbiParam, Block, DataFlowGraph, DynamicStackSlot, DynamicStackSlotData, ExtFuncData,
     ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, Inst, InstBuilder,
     InstBuilderBase, InstructionData, JumpTable, JumpTableData, LibCall, MemFlags, RelSourceLoc,
     SigRef, Signature, StackSlot, StackSlotData, Type, Value, ValueLabel, ValueLabelAssignments,
-    ValueLabelStart,
+    ValueLabelStart, types,
 };
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_codegen::packed_option::PackedOption;
@@ -30,7 +30,7 @@ mod safepoints;
 pub struct FunctionBuilderContext {
     ssa: SSABuilder,
     status: SecondaryMap<Block, BlockStatus>,
-    types: SecondaryMap<Variable, Type>,
+    variables: PrimaryMap<Variable, Type>,
     stack_map_vars: EntitySet<Variable>,
     stack_map_values: EntitySet<Value>,
     safepoints: safepoints::SafepointSpiller,
@@ -71,21 +71,21 @@ impl FunctionBuilderContext {
         let FunctionBuilderContext {
             ssa,
             status,
-            types,
+            variables,
             stack_map_vars,
             stack_map_values,
             safepoints,
         } = self;
         ssa.clear();
         status.clear();
-        types.clear();
+        variables.clear();
         stack_map_values.clear();
         stack_map_vars.clear();
         safepoints.clear();
     }
 
     fn is_empty(&self) -> bool {
-        self.ssa.is_empty() && self.status.is_empty() && self.types.is_empty()
+        self.ssa.is_empty() && self.status.is_empty() && self.variables.is_empty()
     }
 }
 
@@ -151,8 +151,8 @@ impl<'short, 'long> InstBuilderBase<'short> for FuncInstBuilder<'short, 'long> {
             ir::InstructionData::BranchTable { table, .. } => {
                 let pool = &self.builder.func.dfg.value_lists;
 
-                // Unlike all other jumps/branches, jump tables are
-                // capable of having the same successor appear
+                // Unlike most other jumps/branches and like try_call,
+                // jump tables are capable of having the same successor appear
                 // multiple times, so we must deduplicate.
                 let mut unique = EntitySet::<Block>::new();
                 for dest_block in self
@@ -179,7 +179,39 @@ impl<'short, 'long> InstBuilderBase<'short> for FuncInstBuilder<'short, 'long> {
                 }
             }
 
-            inst => debug_assert!(!inst.opcode().is_branch()),
+            ir::InstructionData::TryCall { exception, .. }
+            | ir::InstructionData::TryCallIndirect { exception, .. } => {
+                let pool = &self.builder.func.dfg.value_lists;
+
+                // Unlike most other jumps/branches and like br_table,
+                // exception tables are capable of having the same successor
+                // appear multiple times, so we must deduplicate.
+                let mut unique = EntitySet::<Block>::new();
+                for dest_block in self
+                    .builder
+                    .func
+                    .stencil
+                    .dfg
+                    .exception_tables
+                    .get(*exception)
+                    .expect("you are referencing an undeclared exception table")
+                    .all_branches()
+                {
+                    let block = dest_block.block(pool);
+                    if !unique.insert(block) {
+                        continue;
+                    }
+
+                    // Call `declare_block_predecessor` instead of `declare_successor` for
+                    // avoiding the borrow checker.
+                    self.builder
+                        .func_ctx
+                        .ssa
+                        .declare_block_predecessor(block, inst);
+                }
+            }
+
+            inst => assert!(!inst.opcode().is_branch()),
         }
 
         if data.opcode().is_terminator() {
@@ -211,29 +243,6 @@ impl fmt::Display for UseVariableError {
 }
 
 impl std::error::Error for UseVariableError {}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-/// An error encountered when calling [`FunctionBuilder::try_declare_var`].
-pub enum DeclareVariableError {
-    DeclaredMultipleTimes(Variable),
-}
-
-impl std::error::Error for DeclareVariableError {}
-
-impl fmt::Display for DeclareVariableError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DeclareVariableError::DeclaredMultipleTimes(variable) => {
-                write!(
-                    f,
-                    "variable {} was declared multiple times",
-                    variable.index()
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 /// An error encountered when defining the initial value of a variable.
@@ -400,29 +409,11 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Declares the type of a variable.
     ///
-    /// This allows the variable to be used later (by calling
-    /// [`FunctionBuilder::use_var`]).
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if the variable has been previously
-    /// declared.
-    pub fn try_declare_var(&mut self, var: Variable, ty: Type) -> Result<(), DeclareVariableError> {
-        if self.func_ctx.types[var] != types::INVALID {
-            return Err(DeclareVariableError::DeclaredMultipleTimes(var));
-        }
-        self.func_ctx.types[var] = ty;
-        Ok(())
-    }
-
-    /// Declares the type of a variable, panicking if it is already declared.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the variable has already been declared.
-    pub fn declare_var(&mut self, var: Variable, ty: Type) {
-        self.try_declare_var(var, ty)
-            .unwrap_or_else(|_| panic!("the variable {var:?} has been declared multiple times"))
+    /// This allows the variable to be defined and used later (by calling
+    /// [`FunctionBuilder::def_var`] and [`FunctionBuilder::use_var`]
+    /// respectively).
+    pub fn declare_var(&mut self, ty: Type) -> Variable {
+        self.func_ctx.variables.push(ty)
     }
 
     /// Declare that all uses of the given variable must be included in stack
@@ -441,7 +432,7 @@ impl<'a> FunctionBuilder<'a> {
     /// variable has not been declared yet.
     pub fn declare_var_needs_stack_map(&mut self, var: Variable) {
         log::trace!("declare_var_needs_stack_map({var:?})");
-        let ty = self.func_ctx.types[var];
+        let ty = self.func_ctx.variables[var];
         assert!(ty != types::INVALID);
         assert!(ty.bytes() <= 16);
         self.func_ctx.stack_map_vars.insert(var);
@@ -459,7 +450,7 @@ impl<'a> FunctionBuilder<'a> {
         let (val, side_effects) = {
             let ty = *self
                 .func_ctx
-                .types
+                .variables
                 .get(var)
                 .ok_or(UseVariableError::UsedBeforeDeclared(var))?;
             debug_assert_ne!(
@@ -492,7 +483,7 @@ impl<'a> FunctionBuilder<'a> {
 
         let var_ty = *self
             .func_ctx
-            .types
+            .variables
             .get(var)
             .ok_or(DefVariableError::DefinedBeforeDeclared(var))?;
         if var_ty != self.func.dfg.value_type(val) {
@@ -627,7 +618,7 @@ impl<'a> FunctionBuilder<'a> {
     ///
     /// This can be used to insert SSA code that doesn't need to access locals and that doesn't
     /// need to know about [`FunctionBuilder`] at all.
-    pub fn cursor(&mut self) -> FuncCursor {
+    pub fn cursor(&mut self) -> FuncCursor<'_> {
         self.ensure_inserted_block();
         FuncCursor::new(self.func)
             .with_srcloc(self.srcloc)
@@ -716,7 +707,7 @@ impl<'a> FunctionBuilder<'a> {
         for var in self.func_ctx.stack_map_vars.iter() {
             for val in self.func_ctx.ssa.values_for_var(var) {
                 log::trace!("propagating needs-stack-map from {var:?} to {val:?}");
-                debug_assert_eq!(self.func.dfg.value_type(val), self.func_ctx.types[var]);
+                debug_assert_eq!(self.func.dfg.value_type(val), self.func_ctx.variables[var]);
                 self.func_ctx.stack_map_values.insert(val);
             }
         }
@@ -1199,16 +1190,16 @@ impl<'a> FunctionBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::greatest_divisible_power_of_two;
-    use crate::frontend::{
-        DeclareVariableError, DefVariableError, FunctionBuilder, FunctionBuilderContext,
-        UseVariableError,
-    };
     use crate::Variable;
+    use crate::frontend::{
+        DefVariableError, FunctionBuilder, FunctionBuilderContext, UseVariableError,
+    };
     use alloc::string::ToString;
-    use cranelift_codegen::entity::EntityRef;
     use cranelift_codegen::ir::condcodes::IntCC;
-    use cranelift_codegen::ir::{types::*, UserFuncName};
-    use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, MemFlags, Signature, Value};
+    use cranelift_codegen::ir::{
+        AbiParam, BlockCall, ExceptionTableData, ExtFuncData, ExternalName, Function, InstBuilder,
+        MemFlags, Signature, UserExternalName, UserFuncName, Value, types::*,
+    };
     use cranelift_codegen::isa::{CallConv, TargetFrontendConfig, TargetIsa};
     use cranelift_codegen::settings;
     use cranelift_codegen::verifier::verify_function;
@@ -1228,12 +1219,10 @@ mod tests {
             let block1 = builder.create_block();
             let block2 = builder.create_block();
             let block3 = builder.create_block();
-            let x = Variable::new(0);
-            let y = Variable::new(1);
-            let z = Variable::new(2);
-            builder.declare_var(x, I32);
-            builder.declare_var(y, I32);
-            builder.declare_var(z, I32);
+            let x = builder.declare_var(I32);
+            let y = builder.declare_var(I32);
+            let z = builder.declare_var(I32);
+
             builder.append_block_params_for_function_params(block0);
 
             builder.switch_to_block(block0);
@@ -1355,12 +1344,10 @@ mod tests {
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let x = Variable::new(0);
-            let y = Variable::new(1);
-            let z = Variable::new(2);
-            builder.declare_var(x, frontend_config.pointer_type());
-            builder.declare_var(y, frontend_config.pointer_type());
-            builder.declare_var(z, I32);
+            let x = builder.declare_var(frontend_config.pointer_type());
+            let y = builder.declare_var(frontend_config.pointer_type());
+            let _z = builder.declare_var(I32);
+
             builder.append_block_params_for_function_params(block0);
             builder.switch_to_block(block0);
 
@@ -1404,10 +1391,9 @@ block0:
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let x = Variable::new(0);
-            let y = Variable::new(16);
-            builder.declare_var(x, frontend_config.pointer_type());
-            builder.declare_var(y, frontend_config.pointer_type());
+            let x = builder.declare_var(frontend_config.pointer_type());
+            let y = builder.declare_var(frontend_config.pointer_type());
+
             builder.append_block_params_for_function_params(block0);
             builder.switch_to_block(block0);
 
@@ -1458,10 +1444,8 @@ block0:
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let x = Variable::new(0);
-            let y = Variable::new(16);
-            builder.declare_var(x, frontend_config.pointer_type());
-            builder.declare_var(y, frontend_config.pointer_type());
+            let x = builder.declare_var(frontend_config.pointer_type());
+            let y = builder.declare_var(frontend_config.pointer_type());
             builder.append_block_params_for_function_params(block0);
             builder.switch_to_block(block0);
 
@@ -1515,8 +1499,7 @@ block0:
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let y = Variable::new(16);
-            builder.declare_var(y, frontend_config.pointer_type());
+            let y = builder.declare_var(frontend_config.pointer_type());
             builder.append_block_params_for_function_params(block0);
             builder.switch_to_block(block0);
 
@@ -1555,8 +1538,7 @@ block0:
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let y = Variable::new(16);
-            builder.declare_var(y, frontend_config.pointer_type());
+            let y = builder.declare_var(frontend_config.pointer_type());
             builder.append_block_params_for_function_params(block0);
             builder.switch_to_block(block0);
 
@@ -1614,12 +1596,9 @@ block0:
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let x = Variable::new(0);
-            let y = Variable::new(1);
-            let z = Variable::new(2);
-            builder.declare_var(x, target.pointer_type());
-            builder.declare_var(y, target.pointer_type());
-            builder.declare_var(z, target.pointer_type());
+            let x = builder.declare_var(target.pointer_type());
+            let y = builder.declare_var(target.pointer_type());
+            let z = builder.declare_var(target.pointer_type());
             builder.append_block_params_for_function_params(block0);
             builder.switch_to_block(block0);
 
@@ -1827,10 +1806,8 @@ block0:
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let x = Variable::new(0);
-            let y = Variable::new(1);
-            builder.declare_var(x, target.pointer_type());
-            builder.declare_var(y, target.pointer_type());
+            let x = builder.declare_var(target.pointer_type());
+            let y = builder.declare_var(target.pointer_type());
             builder.append_block_params_for_function_params(block0);
             builder.switch_to_block(block0);
 
@@ -1862,12 +1839,9 @@ block0:
             let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
 
             let block0 = builder.create_block();
-            let a = Variable::new(0);
-            let b = Variable::new(1);
-            let c = Variable::new(2);
-            builder.declare_var(a, I8X16);
-            builder.declare_var(b, I8X16);
-            builder.declare_var(c, F32X4);
+            let a = builder.declare_var(I8X16);
+            let b = builder.declare_var(I8X16);
+            let c = builder.declare_var(F32X4);
             builder.switch_to_block(block0);
 
             let a = builder.use_var(a);
@@ -1932,14 +1906,6 @@ block0:
                     0
                 )))
             );
-
-            builder.declare_var(Variable::from_u32(0), cranelift_codegen::ir::types::I32);
-            assert_eq!(
-                builder.try_declare_var(Variable::from_u32(0), cranelift_codegen::ir::types::I32),
-                Err(DeclareVariableError::DeclaredMultipleTimes(
-                    Variable::from_u32(0)
-                ))
-            );
         }
     }
 
@@ -1969,6 +1935,95 @@ block0:
 block0:
     v0 = iconst.i32 -1
     return
+}",
+        );
+    }
+
+    #[test]
+    fn try_call() {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(I8));
+        sig.returns.push(AbiParam::new(I32));
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let mut func = Function::with_name_signature(UserFuncName::testcase("sample"), sig);
+
+        let sig0 = func.import_signature(Signature::new(CallConv::SystemV));
+        let name = func.declare_imported_user_function(UserExternalName::new(0, 0));
+        let fn0 = func.import_function(ExtFuncData {
+            name: ExternalName::User(name),
+            signature: sig0,
+            colocated: false,
+        });
+
+        let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
+
+        let block0 = builder.create_block();
+        let block1 = builder.create_block();
+        let block2 = builder.create_block();
+        let block3 = builder.create_block();
+
+        let my_var = builder.declare_var(I32);
+
+        builder.switch_to_block(block0);
+        let branch_val = builder.append_block_param(block0, I8);
+        builder.ins().brif(branch_val, block1, &[], block2, &[]);
+
+        builder.switch_to_block(block1);
+        let one = builder.ins().iconst(I32, 1);
+        builder.def_var(my_var, one);
+
+        let normal_return =
+            BlockCall::new(block3, [].into_iter(), &mut builder.func.dfg.value_lists);
+        let exception_table = builder
+            .func
+            .dfg
+            .exception_tables
+            .push(ExceptionTableData::new(sig0, normal_return, []));
+        builder.ins().try_call(fn0, &[], exception_table);
+
+        builder.switch_to_block(block2);
+        let two = builder.ins().iconst(I32, 2);
+        builder.def_var(my_var, two);
+
+        let normal_return =
+            BlockCall::new(block3, [].into_iter(), &mut builder.func.dfg.value_lists);
+        let exception_table = builder
+            .func
+            .dfg
+            .exception_tables
+            .push(ExceptionTableData::new(sig0, normal_return, []));
+        builder.ins().try_call(fn0, &[], exception_table);
+
+        builder.switch_to_block(block3);
+        let ret_val = builder.use_var(my_var);
+        builder.ins().return_(&[ret_val]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        let ctx = cranelift_codegen::Context::for_function(func);
+        ctx.verify(&flags).expect("should be valid");
+
+        check(
+            &ctx.func,
+            "function %sample(i8) -> i32 system_v {
+    sig0 = () system_v
+    fn0 = u0:0 sig0
+
+block0(v0: i8):
+    brif v0, block1, block2
+
+block1:
+    v1 = iconst.i32 1
+    try_call fn0(), sig0, block3(v1), []  ; v1 = 1
+
+block2:
+    v2 = iconst.i32 2
+    try_call fn0(), sig0, block3(v2), []  ; v2 = 2
+
+block3(v3: i32):
+    return v3
 }",
         );
     }

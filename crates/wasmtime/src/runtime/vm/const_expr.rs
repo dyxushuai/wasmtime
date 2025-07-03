@@ -1,10 +1,12 @@
 //! Evaluating const expressions.
 
 use crate::prelude::*;
-use crate::runtime::vm::{Instance, VMGcRef, ValRaw, I31};
-use crate::store::{AutoAssertNoGc, StoreOpaque};
+use crate::runtime::vm::{I31, VMGcRef, ValRaw};
+use crate::store::{AutoAssertNoGc, InstanceId, StoreOpaque};
 #[cfg(feature = "gc")]
-use crate::{ArrayRef, ArrayRefPre, ArrayType, StructRef, StructRefPre, StructType, Val};
+use crate::{
+    AnyRef, ArrayRef, ArrayRefPre, ArrayType, ExternRef, StructRef, StructRefPre, StructType, Val,
+};
 use smallvec::SmallVec;
 use wasmtime_environ::{ConstExpr, ConstOp, FuncIndex, GlobalIndex};
 #[cfg(feature = "gc")]
@@ -20,26 +22,36 @@ pub struct ConstExprEvaluator {
 }
 
 /// The context within which a particular const expression is evaluated.
-pub struct ConstEvalContext<'a> {
-    pub(crate) instance: &'a mut Instance,
+pub struct ConstEvalContext {
+    pub(crate) instance: InstanceId,
 }
 
-impl<'a> ConstEvalContext<'a> {
+impl ConstEvalContext {
     /// Create a new context.
-    pub fn new(instance: &'a mut Instance) -> Self {
+    pub fn new(instance: InstanceId) -> Self {
         Self { instance }
     }
 
     fn global_get(&mut self, store: &mut AutoAssertNoGc<'_>, index: GlobalIndex) -> Result<ValRaw> {
         unsafe {
-            let global = self.instance.defined_or_imported_global_ptr(index).as_ref();
-            global.to_val_raw(store, self.instance.env_module().globals[index].wasm_ty)
+            let mut instance = store.instance_mut(self.instance);
+            let global = instance
+                .as_mut()
+                .defined_or_imported_global_ptr(index)
+                .as_ref();
+            let wasm_ty = instance.env_module().globals[index].wasm_ty;
+            global.to_val_raw(store, wasm_ty)
         }
     }
 
-    fn ref_func(&mut self, index: FuncIndex) -> Result<ValRaw> {
+    fn ref_func(&mut self, store: &mut AutoAssertNoGc<'_>, index: FuncIndex) -> Result<ValRaw> {
         Ok(ValRaw::funcref(
-            self.instance.get_func_ref(index).unwrap().as_ptr().cast(),
+            store
+                .instance_mut(self.instance)
+                .get_func_ref(index)
+                .unwrap()
+                .as_ptr()
+                .cast(),
         ))
     }
 
@@ -84,8 +96,8 @@ impl<'a> ConstEvalContext<'a> {
         store: &mut AutoAssertNoGc<'_>,
         shared_ty: VMSharedTypeIndex,
     ) -> Result<ValRaw> {
-        let module = self
-            .instance
+        let module = store
+            .instance(self.instance)
             .runtime_module()
             .expect("should never be allocating a struct type defined in a dummy module");
 
@@ -149,7 +161,7 @@ impl ConstExprEvaluator {
     pub unsafe fn eval(
         &mut self,
         store: &mut StoreOpaque,
-        context: &mut ConstEvalContext<'_>,
+        context: &mut ConstEvalContext,
         expr: &ConstExpr,
     ) -> Result<ValRaw> {
         log::trace!("evaluating const expr: {:?}", expr);
@@ -181,7 +193,7 @@ impl ConstExprEvaluator {
                 ConstOp::V128Const(v) => self.stack.push(ValRaw::v128(*v)),
                 ConstOp::GlobalGet(g) => self.stack.push(context.global_get(&mut store, *g)?),
                 ConstOp::RefNull => self.stack.push(ValRaw::null()),
-                ConstOp::RefFunc(f) => self.stack.push(context.ref_func(*f)?),
+                ConstOp::RefFunc(f) => self.stack.push(context.ref_func(&mut store, *f)?),
                 ConstOp::RefI31 => {
                     let i = self.pop()?.get_i32();
                     let i31 = I31::wrapping_i32(i);
@@ -224,7 +236,9 @@ impl ConstExprEvaluator {
                 | ConstOp::StructNewDefault { .. }
                 | ConstOp::ArrayNew { .. }
                 | ConstOp::ArrayNewDefault { .. }
-                | ConstOp::ArrayNewFixed { .. } => {
+                | ConstOp::ArrayNewFixed { .. }
+                | ConstOp::ExternConvertAny
+                | ConstOp::AnyConvertExtern => {
                     bail!(
                         "const expr evaluation error: struct operations are not \
                          supported without the `gc` feature"
@@ -233,7 +247,7 @@ impl ConstExprEvaluator {
 
                 #[cfg(feature = "gc")]
                 ConstOp::StructNew { struct_type_index } => {
-                    let interned_type_index = context.instance.env_module().types
+                    let interned_type_index = store.instance(context.instance).env_module().types
                         [*struct_type_index]
                         .unwrap_engine_type_index();
                     let len = context.struct_fields_len(&mut store, interned_type_index);
@@ -257,14 +271,15 @@ impl ConstExprEvaluator {
 
                 #[cfg(feature = "gc")]
                 ConstOp::StructNewDefault { struct_type_index } => {
-                    let ty = context.instance.env_module().types[*struct_type_index]
+                    let ty = store.instance(context.instance).env_module().types
+                        [*struct_type_index]
                         .unwrap_engine_type_index();
                     self.stack.push(context.struct_new_default(&mut store, ty)?);
                 }
 
                 #[cfg(feature = "gc")]
                 ConstOp::ArrayNew { array_type_index } => {
-                    let ty = context.instance.env_module().types[*array_type_index]
+                    let ty = store.instance(context.instance).env_module().types[*array_type_index]
                         .unwrap_engine_type_index();
                     let ty = ArrayType::from_shared_type_index(store.engine(), ty);
 
@@ -282,7 +297,7 @@ impl ConstExprEvaluator {
 
                 #[cfg(feature = "gc")]
                 ConstOp::ArrayNewDefault { array_type_index } => {
-                    let ty = context.instance.env_module().types[*array_type_index]
+                    let ty = store.instance(context.instance).env_module().types[*array_type_index]
                         .unwrap_engine_type_index();
                     let ty = ArrayType::from_shared_type_index(store.engine(), ty);
 
@@ -304,7 +319,7 @@ impl ConstExprEvaluator {
                     array_type_index,
                     array_size,
                 } => {
-                    let ty = context.instance.env_module().types[*array_type_index]
+                    let ty = store.instance(context.instance).env_module().types[*array_type_index]
                         .unwrap_engine_type_index();
                     let ty = ArrayType::from_shared_type_index(store.engine(), ty);
 
@@ -333,6 +348,28 @@ impl ConstExprEvaluator {
 
                     self.stack
                         .push(ValRaw::anyref(array.to_anyref()._to_raw(&mut store)?));
+                }
+
+                #[cfg(feature = "gc")]
+                ConstOp::ExternConvertAny => {
+                    let result = match AnyRef::_from_raw(&mut store, self.pop()?.get_anyref()) {
+                        Some(anyref) => {
+                            ExternRef::_convert_any(&mut store, anyref)?._to_raw(&mut store)?
+                        }
+                        None => 0,
+                    };
+                    self.stack.push(ValRaw::externref(result));
+                }
+
+                #[cfg(feature = "gc")]
+                ConstOp::AnyConvertExtern => {
+                    let result =
+                        match ExternRef::_from_raw(&mut store, self.pop()?.get_externref()) {
+                            Some(externref) => AnyRef::_convert_extern(&mut store, externref)?
+                                ._to_raw(&mut store)?,
+                            None => 0,
+                        };
+                    self.stack.push(ValRaw::anyref(result));
                 }
             }
         }
